@@ -164,7 +164,8 @@ export async function download(start: URL, settings: DownloadSettings, referer?:
 			if (kind === "pdf" && spent > PACE_AFTER_MS) {
 				// At this pace the rest needs twice the time the search has left, so the time goes to another copy. A
 				// download that is only a little behind is kept: the Internet Archive starts slowly and speeds up.
-				const late = declared ? ((declared - size) * spent) / size > 2 * ((settings.deadline?.() ?? Infinity) - Date.now()) : (size * 1_000) / spent < SLOWEST_BYTES_A_SECOND;
+				const left = (settings.deadline?.() ?? Infinity) - Date.now();
+				const late = declared ? ((declared - size) * spent) / size > 2 * left : left !== Infinity && (size * 1_000) / spent < SLOWEST_BYTES_A_SECOND;
 				if (late) {
 					await reader.cancel().catch(() => undefined);
 					return { outcome: "timeout", status: response.status, note: "Too slow to finish in time", url };
@@ -190,8 +191,10 @@ export async function download(start: URL, settings: DownloadSettings, referer?:
 		if (refusal) return { outcome: "blocked", status: response.status, note: refusal, url, hostRefused: true };
 		if (!response.ok) {
 			const refused = response.status === 401 || response.status === 403 || response.status === 429;
-			const wait = Number(response.headers.get("retry-after"));
-			return { outcome: refused ? "blocked" : "http", status: response.status, note: `HTTP ${response.status}`, url, ...(wait > 0 ? { retryAfter: Math.min(wait, 120) } : {}) };
+			// Retry-After is a number of seconds or a date.
+			const header = response.headers.get("retry-after")?.trim() ?? "";
+			const wait = /^\d+$/u.test(header) ? Number(header) : (Date.parse(header) - Date.now()) / 1_000;
+			return { outcome: refused ? "blocked" : "http", status: response.status, note: `HTTP ${response.status}`, url, ...(wait > 0 ? { retryAfter: wait } : {}) };
 		}
 		if (kind === "page") return { outcome: "page", html, url };
 		return { outcome: "not_pdf", status: response.status, note: size ? `Not a PDF: ${type || "no content type"}` : "Empty answer", url };

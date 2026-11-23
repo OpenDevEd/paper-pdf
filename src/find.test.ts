@@ -164,6 +164,29 @@ test("the archive asking for fewer requests is asked again after the time it nam
 	expect(Date.now() - began).toBeGreaterThan(900);
 });
 
+test("a service that asks to be left alone for a long time is not waited for", async () => {
+	const { asked, options } = await serve({
+		...archive({ "https://gone.example/a.pdf": pdf() }),
+		"archive.org/wayback/available": (_request, response) => void response.writeHead(429, { "retry-after": "600" }).end(),
+	});
+	const began = Date.now();
+
+	const result = await findPdf({ urls: ["https://gone.example/a.pdf"] }, options);
+
+	expect(result.ok).toBe(false);
+	expect(asked.filter((key) => key.startsWith("archive.org/wayback/available"))).toHaveLength(1);
+	expect(Date.now() - began).toBeLessThan(5_000);
+});
+
+test("a memory that never answers about a host does not keep the search from ending", async () => {
+	const { options } = await serve({ "publisher.example/a.pdf": pdf() });
+	const memory = { get: (key: string) => (key.startsWith("host:") ? new Promise(() => undefined) : undefined), set: () => undefined };
+
+	const result = await findPdf({ urls: ["https://publisher.example/a.pdf"] }, { ...options, memory, budgetMs: 300 });
+
+	expect(result).toMatchObject({ ok: false, reason: "unreachable" });
+});
+
 test("a sign-in page at a PDF link is passed over, and a PDF with another content type is taken", async () => {
 	const { options } = await serve({
 		"publisher.example/a.pdf": page("<html><body>Sign in to continue</body></html>"),

@@ -95,6 +95,8 @@ const PACED: Record<string, { everyMs: number; atOnce: number }> = {
 };
 /** How long a paced service is left alone after a 429 that names no time. The archive answered again within 33 seconds. */
 const BACKOFF_MS = 30_000;
+/** A request waits out a service's hold up to this long. During a longer one the service is skipped. */
+const LONGEST_HOLD_MS = 60_000;
 /** What a quick search leaves out. */
 const SLOW: ReadonlySet<Source> = new Set<Source>(["unpaywall", "openalex", "crossref", "wayback", "openalex-copy"]);
 /** A host that showed a bot challenge is not asked again for this long. */
@@ -112,13 +114,13 @@ const LOOKUP_MS = 5_000;
 /** While a PDF is arriving, another copy starts beside it only after this many hedge intervals: the download is slow. */
 const SLOW_DELIVERY = 6;
 
-type Host = { active: number; waiting: (() => void)[]; strikes: number; /** Times in a row it was left alone for striking out. */ outs: number; until: number; note: string; /** When a paced host may next be asked. */ next: number; remembered?: Promise<void> };
+type Host = { active: number; waiting: (() => void)[]; strikes: number; /** Times in a row it was left alone for striking out. */ outs: number; until: number; note: string; /** When a paced host may next be asked. */ next: number; /** Until when a paced host asked to be left alone. */ quiet: number; remembered?: Promise<void> };
 // ponytail: one small record a host, kept for the life of the process. Prune the idle ones if a worker ever sees millions of hosts.
 const hosts = new Map<string, Host>();
 
 const hostOf = (name: string) => {
 	let host = hosts.get(name);
-	if (!host) hosts.set(name, (host = { active: 0, waiting: [], strikes: 0, outs: 0, until: 0, note: "", next: 0 }));
+	if (!host) hosts.set(name, (host = { active: 0, waiting: [], strikes: 0, outs: 0, until: 0, note: "", next: 0, quiet: 0 }));
 	return host;
 };
 
@@ -169,8 +171,9 @@ class Search {
 	private readonly timers = new Set<ReturnType<typeof setTimeout>>();
 	/** Moves later by the time the search spends waiting for a host's turn. */
 	private deadline: number;
-	/** Requests waiting for a host's turn. */
+	/** Requests waiting for a host's turn, and since when at least one has been. */
 	private inLine = 0;
+	private lineSince = 0;
 	private readonly inFlight = new Map<Candidate, number>();
 	private readonly paper: Paper;
 	private readonly fetch: typeof fetch;
@@ -401,11 +404,32 @@ class Search {
 	/** One request. A paced service that says it is getting too many is left alone by every search for a while, then asked once more. */
 	private async ask(url: URL, settings: Pick<DownloadSettings, "signal" | "deadline" | "answerMs" | "onPdf">, referer?: URL): Promise<Fetched> {
 		const all = { ...settings, fetch: this.fetch, userAgent: this.userAgent, maxBytes: this.maxBytes, enter: (host: string) => this.enter(host) };
+		// Whether a paced service said it is getting too many, which every search then heeds.
+		const held = (fetched: Fetched) => {
+			if (!(fetched.url.hostname in PACED) || fetched.outcome !== "blocked" || fetched.status !== 429) return false;
+			hostOf(fetched.url.hostname).quiet = Date.now() + (fetched.retryAfter ? fetched.retryAfter * 1_000 : BACKOFF_MS);
+			return true;
+		};
 		const fetched = await download(url, all, referer);
-		if (!(fetched.url.hostname in PACED) || fetched.outcome !== "blocked" || fetched.status !== 429) return fetched;
-		const host = hostOf(fetched.url.hostname);
-		host.next = Math.max(host.next, Date.now() + (fetched.retryAfter ? fetched.retryAfter * 1_000 : BACKOFF_MS));
-		return download(url, all, referer);
+		if (!held(fetched)) return fetched;
+		// Waits in `enter` for the hold to end, or is skipped there when the hold is long.
+		const again = await download(url, all, referer);
+		held(again);
+		return again;
+	}
+
+	/** Waits until a time, or until the search ends. */
+	private sleepUntil(time: number) {
+		return new Promise<void>((resolve) => {
+			const over = () => {
+				clearTimeout(timer);
+				this.ended.signal.removeEventListener("abort", over);
+				resolve();
+			};
+			const timer = setTimeout(over, Math.max(0, time - Date.now()));
+			this.ended.signal.addEventListener("abort", over, { once: true });
+			if (this.ended.signal.aborted) over();
+		});
 	}
 
 	/**
@@ -414,11 +438,9 @@ class Search {
 	 * memory holds.
 	 */
 	private async enter(name: string): Promise<(() => void) | string> {
-		const began = Date.now();
 		const host = hostOf(name);
 		const paced = PACED[name];
 		const { memory } = this.options;
-		this.inLine++;
 		if (memory) {
 			// Read once a process, and waited for by every search that asks meanwhile. A memory that fails is read as empty.
 			host.remembered ??= Promise.resolve(memory.get(`host:${name}`)).then(
@@ -430,37 +452,32 @@ class Search {
 			);
 			await host.remembered;
 		}
-		while (host.active >= (paced?.atOnce ?? PER_HOST)) await new Promise<void>((wake) => host.waiting.push(wake));
 		const leave = () => {
 			host.active--;
 			host.waiting.shift()?.();
 		};
-		host.active++;
-		if (paced) {
-			const turn = Math.max(host.next, Date.now());
-			host.next = turn + paced.everyMs;
-			// Ends early when the search does, so nothing is left waiting.
-			if (turn > Date.now()) {
-				await new Promise<void>((resolve) => {
-					const over = () => {
-						clearTimeout(timer);
-						this.ended.signal.removeEventListener("abort", over);
-						resolve();
-					};
-					const timer = setTimeout(over, turn - Date.now());
-					this.ended.signal.addEventListener("abort", over, { once: true });
-				});
+		// Reading the memory above counts against the budget. Waiting for a turn does not: it is the host's limit and
+		// not the paper's slowness. The search gets that time back, counted once however many of its requests wait.
+		if (this.inLine++ === 0) this.lineSince = Date.now();
+		try {
+			while (host.active >= (paced?.atOnce ?? PER_HOST)) await new Promise<void>((wake) => host.waiting.push(wake));
+			host.active++;
+			// A search that ended while it waited takes no turn from the others.
+			if (paced && !this.done) {
+				const turn = Math.max(host.next, Date.now());
+				host.next = turn + paced.everyMs;
+				await this.sleepUntil(turn);
+				// A 429 that came meanwhile asks every search to hold off.
+				while (!this.done && host.quiet > Date.now() && host.quiet - Date.now() <= LONGEST_HOLD_MS) await this.sleepUntil(host.quiet);
 			}
+		} finally {
+			if (--this.inLine === 0) this.deadline += Date.now() - this.lineSince;
 		}
-		// Time in line is the host's limit and not the paper's, so the search gets it back.
-		this.deadline += Date.now() - began;
-		this.inLine--;
 		// Checked after the wait: the host may have refused another paper meanwhile.
-		if (host.until > Date.now() || this.done) {
-			leave();
-			return this.done ? "Stopped" : `Host left alone: ${host.note}`;
-		}
-		return leave;
+		const refusal = this.done ? "Stopped" : host.until > Date.now() ? `Host left alone: ${host.note}` : host.quiet > Date.now() ? "Host left alone: it asked for fewer requests" : undefined;
+		if (!refusal) return leave;
+		leave();
+		return refusal;
 	}
 
 	/** One download, and what its answer says about the host. */
