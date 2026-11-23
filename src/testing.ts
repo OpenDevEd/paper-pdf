@@ -5,7 +5,10 @@ import type { AddressInfo } from "node:net";
 
 export type Handler = (request: IncomingMessage, response: ServerResponse) => void;
 
-export const PDF = Buffer.concat([Buffer.from("%PDF-1.7\n"), Buffer.alloc(2_000, "x"), Buffer.from("\n%%EOF\n")]);
+const BODY = Buffer.concat([Buffer.from("%PDF-1.7\n1 0 obj\n<<>>\nendobj\n"), Buffer.alloc(2_000, " ")]);
+
+/** The smallest file with a PDF's first line, a table of objects and an ending that names where the table starts. */
+export const PDF = Buffer.concat([BODY, Buffer.from(`xref\n0 1\n0000000000 65535 f \ntrailer\n<<>>\nstartxref\n${BODY.byteLength}\n%%EOF\n`)]);
 
 export const pdf = (bytes: Buffer = PDF, type = "application/pdf"): Handler => (_request, response) => {
 	response.writeHead(200, { "content-type": type, "content-length": bytes.byteLength }).end(bytes);

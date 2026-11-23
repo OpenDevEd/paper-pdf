@@ -29,7 +29,7 @@ test("a server on this machine is not reached, by its address or by a name that 
 
 	// The server is up and answers a plain fetch, so a refusal below is the guard's and not a closed port.
 	expect((await fetch(`http://localhost:${site.port}/`)).status).toBe(404);
-	await expect(publicFetch(`http://127.0.0.1:${site.port}/`)).rejects.toThrow("Private address");
+	await expect(publicFetch(`http://127.0.0.1:${site.port}/`)).rejects.toMatchObject({ cause: { message: "Private address is not allowed" } });
 	await expect(publicFetch(`http://localhost:${site.port}/`)).rejects.toMatchObject({ cause: { message: "Private address is not allowed" } });
 	expect(site.asked).toHaveLength(1);
 });

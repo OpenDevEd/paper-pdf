@@ -1,6 +1,6 @@
 /** Where a paper's copies are looked for. Each service is asked once per paper and answers with links to try. */
 
-import { looksLikePdfUrl } from "./check.ts";
+import { isSupplementUrl, looksLikePdfUrl } from "./check.ts";
 
 export type Source =
 	| "given"
@@ -111,7 +111,11 @@ export function listedFiles(body: string, listing: URL): URL[] | undefined {
 		return keys.sort((a, b) => b.version - a.version).map(({ key }) => new URL(PMC_FILES + key));
 	}
 	if (listing.href.startsWith(FIGSHARE_ITEMS)) {
-		const files = list(record(parsed(body))["files"]).filter((file) => file["mimetype"] === "application/pdf" || /\.pdf$/iu.test(String(file["name"])));
+		// The download address is a number, so a supplement can only be told by the file's name.
+		const files = list(record(parsed(body))["files"]).filter((file) => {
+			const name = typeof file["name"] === "string" ? file["name"] : "";
+			return (file["mimetype"] === "application/pdf" || /\.pdf$/iu.test(name)) && !isSupplementUrl(new URL(`https://figshare.com/${encodeURIComponent(name)}`));
+		});
 		return files.flatMap((file) => toUrl(file["download_url"]) ?? []);
 	}
 	if (listing.href.startsWith(`${ARCHIVE_HAS}?`)) {
@@ -130,9 +134,11 @@ const FIGSHARE_ITEMS = "https://api.figshare.com/v2/articles/";
  * its articles, figshare's record of an item, whose page needs a browser, and the fixed path of an arXiv abstract's PDF.
  */
 export function rewritten(url: URL): URL | undefined {
-	const pmc = /(?:ncbi\.nlm\.nih\.gov\/pmc|pmc\.ncbi\.nlm\.nih\.gov|europepmc\.org)\/(?:articles|article\/PMC)\/(?:PMC)?(\d+)/iu.exec(url.href)?.[1];
+	// Matched on the host and the path, so another site's link that only mentions one of these is left as it is.
+	const pmc = /^(?:(?:www\.)?ncbi\.nlm\.nih\.gov\/pmc|pmc\.ncbi\.nlm\.nih\.gov|europepmc\.org)\/(?:articles|article\/PMC)\/(?:PMC)?(\d+)(?:\/|$)/iu.exec(url.hostname + url.pathname)?.[1];
 	if (pmc) return pmcListing(pmc);
-	const figshare = /(?:^|\.)figshare\.com$/iu.test(url.hostname) ? /^\/articles\/(?:[^/]+\/)*(\d+)(?:\/\d+)?\/?$/u.exec(url.pathname)?.[1] : undefined;
+	// The item's number, which a version number of up to three digits may follow.
+	const figshare = /(?:^|\.)figshare\.com$/iu.test(url.hostname) ? /^\/articles\/(?:[^/]+\/)*?(\d+)(?:\/\d{1,3})?\/?$/u.exec(url.pathname)?.[1] : undefined;
 	if (figshare) return new URL(FIGSHARE_ITEMS + figshare);
 	const arxiv = /^(?:www\.)?arxiv\.org$/iu.test(url.hostname) ? /^\/abs\/(.+)$/u.exec(url.pathname)?.[1] : undefined;
 	if (arxiv) return new URL(`https://arxiv.org/pdf/${arxiv}`);
@@ -140,6 +146,9 @@ export function rewritten(url: URL): URL | undefined {
 }
 
 export const openAlexCopy = (work: string, key: string) => new URL(`https://content.openalex.org/works/${work}.pdf?api_key=${encodeURIComponent(key)}`);
+
+/** Whether the caller holds the paper's OpenAlex record: it passed OpenAlex's ID and links. Links alone may be from anywhere. */
+const fromOpenAlex = (paper: Paper) => Boolean(openAlexWork(paper.openalexId) && paper.urls?.length);
 
 export type LookupSettings = { contactEmail?: string | undefined; openAlexKey?: string | undefined };
 
@@ -151,10 +160,10 @@ type Lookup = { source: Source; applies: (paper: Paper, settings: LookupSettings
 
 export const LOOKUPS: Lookup[] = [
 	{
-		// Unpaywall asks callers to name themselves by email and refuses placeholders. It is asked only for a paper that
-		// came with no links: OpenAlex's links are Unpaywall's, and for 343 papers that had them it named no other copy.
+		// Unpaywall asks callers to name themselves by email and refuses placeholders. It is not asked for a paper that
+		// came from OpenAlex with links: those links are Unpaywall's, and for 343 such papers it named no other copy.
 		source: "unpaywall",
-		applies: (paper, settings) => Boolean(normalizeDoi(paper.doi) && settings.contactEmail && !paper.urls?.length),
+		applies: (paper, settings) => Boolean(normalizeDoi(paper.doi) && settings.contactEmail && !fromOpenAlex(paper)),
 		async run(paper, settings, json) {
 			const url = new URL(`https://api.unpaywall.org/v2/${encodeURIComponent(normalizeDoi(paper.doi)!)}`);
 			url.searchParams.set("email", settings.contactEmail!);
@@ -168,9 +177,9 @@ export const LOOKUPS: Lookup[] = [
 		},
 	},
 	{
-		// Only for a caller that holds no OpenAlex record: one that passed links got them from it already.
+		// Only for a caller that holds no OpenAlex record.
 		source: "openalex",
-		applies: (paper, settings) => Boolean(settings.openAlexKey && !paper.urls?.length && (openAlexWork(paper.openalexId) || normalizeDoi(paper.doi))),
+		applies: (paper, settings) => Boolean(settings.openAlexKey && !fromOpenAlex(paper) && (openAlexWork(paper.openalexId) || normalizeDoi(paper.doi))),
 		async run(paper, settings, json) {
 			const work = openAlexWork(paper.openalexId);
 			const url = new URL(`https://api.openalex.org/works/${work ?? `doi:${encodeURI(normalizeDoi(paper.doi)!)}`}`);

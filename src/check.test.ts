@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
-import { articleProblem, isPublicUrl, pdfLinks } from "./check.ts";
+import { articleProblem, isPublicUrl, isSupplementUrl, isWholePdf, pdfLinks } from "./check.ts";
+import { PDF } from "./testing.ts";
 
 test.each([
 	["https://journals.example.org/a.pdf", true],
@@ -45,6 +46,26 @@ test("a page's declared PDF comes first, and what is not the paper is left out",
 		"https://journals.example.org/article/1/pdf",
 		"https://cdn.example.org/1.pdf",
 	]);
+});
+
+test("two universities under one country's registry are two sites", () => {
+	const html = '<a href="https://www.repository.cam.ac.uk/files/cited.pdf">PDF</a><a href="https://files.ox.ac.uk/objects/1/paper.pdf">Download PDF</a>';
+
+	expect(pdfLinks(html, new URL("https://ora.ox.ac.uk/objects/1")).map((url) => url.href)).toEqual(["https://files.ox.ac.uk/objects/1/paper.pdf"]);
+});
+
+test("a supplement is told by its name, and a path that is not text is judged as written", () => {
+	expect(isSupplementUrl(new URL("https://pmc.example/bin/NIHMS1-supplement-Supporting_Information.pdf"))).toBe(true);
+	expect(isSupplementUrl(new URL("https://ars.els-cdn.example/content/mmc1.pdf"))).toBe(true);
+	expect(isSupplementUrl(new URL("https://publisher.example/%FF.pdf"))).toBe(false);
+	expect(isSupplementUrl(new URL("https://publisher.example/articles/supply-chains.pdf"))).toBe(false);
+});
+
+test("a PDF is whole when its ending names where its table of objects starts", () => {
+	expect(isWholePdf(PDF)).toBe(true);
+	expect(isWholePdf(PDF.subarray(0, 1_500))).toBe(false);
+	expect(isWholePdf(Buffer.from("%PDF-1.7\njunk\n%%EOF\n"))).toBe(false);
+	expect(isWholePdf(Buffer.from("%PDF-1.7\njunk\nstartxref\n9\n%%EOF\n"))).toBe(false);
 });
 
 test("a short PDF is the paper unless its text says it is a cover sheet or a preview", () => {

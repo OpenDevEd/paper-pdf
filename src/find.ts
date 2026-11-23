@@ -11,7 +11,7 @@
  * It stops at the first file that is a PDF and the paper.
  */
 
-import { isPublicUrl, isSupplementUrl, looksLikePdfUrl, pdfLinks } from "./check.ts";
+import { isSupplementUrl, looksLikePdfUrl, pdfLinks } from "./check.ts";
 import { download, type Fetched, type Outcome } from "./download.ts";
 import { archivedFrom, type Candidate, given, listedFiles, LOOKUPS, normalizeDoi, openAlexCopy, openAlexWork, type Paper, RANK, rewritten, type Source, waybackCopy } from "./sources.ts";
 
@@ -86,12 +86,12 @@ const LOOKUP_MS = 5_000;
 /** While a PDF is arriving, another copy starts beside it only after this many hedge intervals: the download is slow. */
 const SLOW_DELIVERY = 6;
 
-type Host = { active: number; waiting: (() => void)[]; strikes: number; until: number; note: string; asked: boolean };
+type Host = { active: number; waiting: (() => void)[]; strikes: number; until: number; note: string; remembered?: Promise<void> };
 const hosts = new Map<string, Host>();
 
 const hostOf = (name: string) => {
 	let host = hosts.get(name);
-	if (!host) hosts.set(name, (host = { active: 0, waiting: [], strikes: 0, until: 0, note: "", asked: false }));
+	if (!host) hosts.set(name, (host = { active: 0, waiting: [], strikes: 0, until: 0, note: "" }));
 	return host;
 };
 
@@ -176,7 +176,7 @@ class Search {
 	start() {
 		const { paper, options } = this;
 		if (options.signal?.aborted) return this.finish();
-		options.signal?.addEventListener("abort", () => this.finish(), { once: true });
+		options.signal?.addEventListener("abort", this.stopped, { once: true });
 		for (const candidate of given(paper)) this.add(candidate);
 		const closed = paper.openAccess === false && !options.searchClosed && !paper.urls?.length && !paper.pmcid;
 		if (closed) {
@@ -191,6 +191,8 @@ class Search {
 		});
 		this.pump();
 	}
+
+	private readonly stopped = () => this.finish();
 
 	private uses(source: Source) {
 		return !this.options.without?.includes(source);
@@ -229,7 +231,8 @@ class Search {
 	private pump() {
 		if (this.done) return;
 		const now = Date.now();
-		const promising = this.queue.some((candidate) => candidate.rank <= RANK.rewrite);
+		// The caller's own links and the PDFs their pages declare, waiting or under way, get their chance before the services are asked.
+		const promising = [...this.queue, ...this.inFlight.keys()].some((candidate) => candidate.source === "given" || candidate.rank < RANK.found);
 		// The wait before something starts beside what is running. It is long while a PDF is arriving: most searches end there.
 		const wait = this.delivering ? this.hedgeMs * SLOW_DELIVERY : this.hedgeMs;
 		if (this.lookups === "waiting" && (this.failed || !promising || now - this.started >= wait)) this.startLookups();
@@ -241,11 +244,17 @@ class Search {
 			this.running++;
 			this.lastStart = Date.now();
 			this.inFlight.set(next, this.lastStart);
-			void this.attempt(next).then(() => {
+			const settle = () => {
 				this.inFlight.delete(next);
 				this.running--;
 				this.pump();
-			});
+			};
+			// The caller's `accept` or `memory` threw. The search goes on with the next link.
+			const broke = (error: unknown) => {
+				if (!this.done) this.note(next.url.href, next.source, { outcome: "rejected", note: `Failed: ${error instanceof Error ? error.message : String(error)}` }, this.inFlight.get(next) ?? Date.now(), next.secret);
+				settle();
+			};
+			void this.attempt(next).then(settle, broke);
 		}
 		if (this.running === 0 && this.queue.length === 0 && this.lookups === "done") return this.finish();
 		// Looks again once the wait is over, at a link that is slow to answer or to deliver.
@@ -275,9 +284,10 @@ class Search {
 						const stop = () => slow.abort();
 						this.ended.signal.addEventListener("abort", stop, { once: true });
 						try {
-							const response = await this.fetch(url, { headers: { Accept: "application/json", "User-Agent": this.userAgent }, signal: slow.signal });
-							if (!response.ok) throw new Error(`HTTP ${response.status}`);
-							return await response.json();
+							// Read like any link: within the host's turn, each redirect checked, and no further than a page is read.
+							const answer = await download(url, { fetch: this.fetch, userAgent: this.userAgent, maxBytes: this.maxBytes, signal: slow.signal, enter: (host) => this.enter(host) });
+							if (answer.outcome !== "page") throw new Error("note" in answer ? answer.note : "Not JSON");
+							return JSON.parse(answer.html) as unknown;
 						} finally {
 							clearTimeout(timer);
 							this.ended.signal.removeEventListener("abort", stop);
@@ -298,8 +308,9 @@ class Search {
 	}
 
 	private note(url: string, source: Source, result: { outcome: Outcome; status?: number; note?: string }, began: number, secret?: string) {
-		const shown = secret ? url.replaceAll(encodeURIComponent(secret), "…") : url;
-		this.attempts.push({ url: shown, source, outcome: result.outcome, ...(result.status ? { status: result.status } : {}), ...(result.note ? { note: result.note } : {}), ms: Date.now() - began });
+		// An error may quote the address it failed on, so the key is cut from the note as well.
+		const cut = (text: string) => (secret ? text.replaceAll(encodeURIComponent(secret), "…").replaceAll(secret, "…") : text);
+		this.attempts.push({ url: cut(url), source, outcome: result.outcome, ...(result.status ? { status: result.status } : {}), ...(result.note ? { note: cut(result.note) } : {}), ms: Date.now() - began });
 	}
 
 	private async attempt(candidate: Candidate) {
@@ -330,10 +341,11 @@ class Search {
 			const next = { rank: Math.min(candidate.rank, RANK.rewrite), depth: candidate.depth + (listed ? 0 : 1) };
 			for (const url of links) {
 				if (listed) this.add({ ...next, url, source: candidate.source, rank: candidate.rank });
-				else if (archived) this.addWayback({ ...next, url, source: "page" }, candidate.rank);
+				else if (archived) this.addWayback({ ...next, url, source: "page" }, candidate.rank, true);
 				else this.add({ ...next, url, source: "page", referer: fetched.url });
 			}
-			record({ outcome: links.length ? "page" : "not_pdf", note: links.length ? `${links.length} links` : "No PDF link" });
+			// A listing is a question about where copies are. Only a page that should have led to the paper counts as a failed copy.
+			record({ outcome: listed ? "lookup" : links.length ? "page" : "not_pdf", note: links.length ? `${links.length} links` : "No PDF link" });
 			// A PDF's own address that now serves a page: the archive may hold the file it used to serve.
 			if (!links.length && looksLikePdfUrl(candidate.url)) this.addWayback(candidate);
 			return;
@@ -344,41 +356,65 @@ class Search {
 		this.addWayback(candidate);
 	}
 
-	/** Asks the archive for its copy of a link that failed. A PDF's own address is worth more than a page's. */
-	private addWayback(candidate: Candidate, rank = RANK.wayback + Math.max(candidate.rank, 0) / 10) {
-		if (candidate.source === "wayback" || candidate.secret || this.waybacks >= MAX_WAYBACK || !this.uses("wayback")) return;
+	/**
+	 * Asks the archive for its copy of a link that failed. A PDF's own address is worth more than a page's. At most
+	 * `MAX_WAYBACK` failed links are asked about. A link found on a saved page is always asked about: it is where a
+	 * copy that the archive does hold leads.
+	 */
+	private addWayback(candidate: Candidate, rank = RANK.wayback + Math.max(candidate.rank, 0) / 10, found = false) {
+		if (candidate.source === "wayback" || candidate.secret || (!found && this.waybacks >= MAX_WAYBACK) || !this.uses("wayback")) return;
 		const index = waybackCopy(candidate.url);
 		if (this.seen.has(index.href)) return;
-		this.waybacks++;
+		if (!found) this.waybacks++;
 		this.add({ url: index, source: "wayback", rank, depth: candidate.depth });
 	}
 
-	/** One download, within the host's share of connections, unless the host is being left alone. */
-	private async fetchFromHost(candidate: Candidate): Promise<Fetched> {
-		const { url } = candidate;
-		const host = hostOf(url.hostname);
+	/**
+	 * Waits for a host's turn: at most `PER_HOST` requests at a time in this process. Says why instead when the host
+	 * is being left alone, by what this process saw or by what the shared memory holds.
+	 */
+	private async enter(name: string): Promise<(() => void) | string> {
+		const host = hostOf(name);
 		const { memory } = this.options;
-		if (!isPublicUrl(url)) return { outcome: "unsafe", note: "Not a public address", url };
-		if (!host.asked && memory) {
-			host.asked = true;
-			const kept = (await memory.get(`host:${url.hostname}`)) as { until?: unknown; note?: unknown } | null | undefined;
-			if (typeof kept?.until === "number" && kept.until > host.until) Object.assign(host, { until: kept.until, note: typeof kept.note === "string" ? kept.note : "" });
+		if (memory) {
+			// Read once a process, and waited for by every search that asks meanwhile. A memory that fails is read as empty.
+			host.remembered ??= Promise.resolve(memory.get(`host:${name}`)).then(
+				(value) => {
+					const kept = value as { until?: unknown; note?: unknown } | null | undefined;
+					if (typeof kept?.until === "number" && kept.until > host.until) Object.assign(host, { until: kept.until, note: typeof kept.note === "string" ? kept.note : "" });
+				},
+				() => undefined,
+			);
+			await host.remembered;
 		}
-		if (host.until > Date.now()) return { outcome: "skipped", note: `Host left alone: ${host.note}`, url };
-
 		while (host.active >= PER_HOST) await new Promise<void>((wake) => host.waiting.push(wake));
+		const leave = () => {
+			host.active--;
+			host.waiting.shift()?.();
+		};
 		host.active++;
+		// Checked after the wait: the host may have refused another paper meanwhile.
+		if (host.until > Date.now() || this.done) {
+			leave();
+			return this.done ? "Stopped" : `Host left alone: ${host.note}`;
+		}
+		return leave;
+	}
+
+	/** One download, and what its answer says about the host. */
+	private async fetchFromHost(candidate: Candidate): Promise<Fetched> {
+		const { memory } = this.options;
 		let delivering = false;
 		try {
-			if (this.done) return { outcome: "cancelled", note: "Stopped", url };
 			const fetched = await download(
-				url,
+				candidate.url,
 				{
 					fetch: this.fetch,
 					userAgent: this.userAgent,
 					maxBytes: this.maxBytes,
 					signal: this.ended.signal,
 					deadline: this.deadline,
+					enter: (host) => this.enter(host),
 					onPdf: () => {
 						delivering = true;
 						this.delivering++;
@@ -401,8 +437,6 @@ class Search {
 			return fetched;
 		} finally {
 			if (delivering) this.delivering--;
-			host.active--;
-			host.waiting.shift()?.();
 		}
 	}
 
@@ -410,6 +444,7 @@ class Search {
 		if (this.done) return;
 		this.done = true;
 		for (const timer of this.timers) clearTimeout(timer);
+		this.options.signal?.removeEventListener("abort", this.stopped);
 		this.ended.abort();
 		const ms = Date.now() - this.started;
 		const { attempts } = this;

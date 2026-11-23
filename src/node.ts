@@ -2,7 +2,7 @@
 
 import { lookup, type LookupAddress } from "node:dns";
 import { BlockList, isIP } from "node:net";
-import { Agent, fetch as undiciFetch } from "undici";
+import { Agent, buildConnector, fetch as undiciFetch } from "undici";
 
 /**
  * Addresses outside the public internet, from the IANA special-purpose registries: private, loopback, link-local,
@@ -47,34 +47,36 @@ function mappedIpv4(address: string) {
 	return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
 }
 
+const REFUSED = "Private address is not allowed";
+
 /**
  * Connects only to addresses its own lookup accepted, so a name cannot resolve to a public address for the check and
  * to a private one for the connection.
  */
-const publicOnly = new Agent({
+const connect = buildConnector({
 	// Springer Nature's Fastly answers HTTP/1.1 requests from undici with a JavaScript challenge, but not HTTP/2 ones.
 	allowH2: true,
-	connect: {
-		lookup(hostname, options, callback) {
-			lookup(hostname, { all: true }, (error, addresses) => {
-				if (error) return callback(error, "", 0);
-				if (!addresses.length || addresses.some(({ address }) => isPrivateIp(address))) {
-					return callback(new Error("Private address is not allowed"), "", 0);
-				}
-				if (options.all) return (callback as (error: null, addresses: LookupAddress[]) => void)(null, addresses);
-				callback(null, addresses[0]!.address, addresses[0]!.family);
-			});
-		},
+	lookup(hostname, options, callback) {
+		lookup(hostname, { all: true }, (error, addresses) => {
+			if (error) return callback(error, "", 0);
+			if (!addresses.length || addresses.some(({ address }) => isPrivateIp(address))) return callback(new Error(REFUSED), "", 0);
+			if (options.all) return (callback as (error: null, addresses: LookupAddress[]) => void)(null, addresses);
+			callback(null, addresses[0]!.address, addresses[0]!.family);
+		});
 	},
 });
 
-/**
- * `fetch` that refuses a name resolving to a private address, and an address written out that is private. `findPdf`
- * follows redirects itself and checks each one, so every request of a search passes through here.
- */
-export const publicFetch = ((input: Parameters<typeof undiciFetch>[0], init?: Parameters<typeof undiciFetch>[1]) => {
-	const url = new URL(typeof input === "object" && "url" in input ? input.url : input);
-	const host = url.hostname.replace(/^\[|\]$/gu, "");
-	if (isIP(host) && isPrivateIp(host)) return Promise.reject(new Error("Private address is not allowed"));
-	return undiciFetch(input, { ...init, dispatcher: publicOnly });
-}) as unknown as typeof fetch;
+const publicOnly = new Agent({
+	allowH2: true,
+	// An address written out is never looked up, so it is checked here, on every connection: the first, and any a
+	// redirect leads to.
+	connect(options, callback) {
+		const host = options.hostname.replace(/^\[|\]$/gu, "");
+		if (isIP(host) && isPrivateIp(host)) return callback(new Error(REFUSED), null);
+		connect(options, callback);
+	},
+});
+
+/** `fetch` that connects only to the public internet, whatever a link, a redirect or a name's DNS record says. */
+export const publicFetch = ((input: Parameters<typeof undiciFetch>[0], init?: Parameters<typeof undiciFetch>[1]) =>
+	undiciFetch(input, { ...init, dispatcher: publicOnly })) as unknown as typeof fetch;

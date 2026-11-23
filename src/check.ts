@@ -11,17 +11,18 @@ export function isPdf(bytes: Uint8Array): boolean {
 	return false;
 }
 
-const PDF_END = [0x25, 0x25, 0x45, 0x4f, 0x46]; // %%EOF
-
 /**
- * Whether a PDF arrived whole: one ends with an end-of-file mark, and a download that stopped early has none. On
- * 241 downloaded files this agreed every time with whether pdf.js could open the file.
+ * Whether a PDF arrived whole. A PDF ends by naming where its table of objects starts (`startxref`, a position,
+ * `%%EOF`), and that position holds the table. A download that stopped early has no such ending, and junk between a
+ * first line and a last line of a PDF has no table. This reads no further into the file: a caller that parses PDFs
+ * passes its parser as `accept`. All 180 papers of one benchmark run passed, and the three cut-short files the
+ * Internet Archive served in earlier runs did not.
  */
 export function isWholePdf(bytes: Uint8Array): boolean {
-	for (let at = bytes.byteLength - PDF_END.length; at >= Math.max(0, bytes.byteLength - 4_096); at--) {
-		if (PDF_END.every((byte, offset) => bytes[at + offset] === byte)) return true;
-	}
-	return false;
+	const text = (from: number, to: number) => String.fromCharCode(...bytes.subarray(Math.max(0, from), to));
+	const endings = [...text(bytes.byteLength - 4_096, bytes.byteLength).matchAll(/startxref\s+(\d+)\s+%%EOF/gu)];
+	const table = Number(endings.at(-1)?.[1] ?? Number.NaN);
+	return table < bytes.byteLength && /^\s*(?:xref|\d+\s+\d+\s+obj)/u.test(text(table, table + 40));
 }
 
 /**
@@ -55,7 +56,13 @@ export function isPublicUrl(url: URL): boolean {
  * the way PubMed Central, Elsevier and Springer name supplements.
  */
 export function isSupplementUrl(url: URL): boolean {
-	const path = decodeURIComponent(url.pathname.replace(/%(?![0-9a-f]{2})/giu, "%25")).toLowerCase();
+	let path = url.pathname;
+	try {
+		path = decodeURIComponent(path);
+	} catch {
+		// Escapes that are not text are judged as written.
+	}
+	path = path.toLowerCase();
 	if (path.includes("/downloadsupplement") || path.includes("/suppl_file/")) return true;
 	return /supplement|supporting[_-]?info|[-_]suppl?[-_.\d]|^mmc\d+\.pdf$|moesm\d|_esm\.pdf$/u.test(path.split("/").at(-1) ?? "");
 }
@@ -95,8 +102,16 @@ const attribute = (tag: string, name: string) =>
 
 const LINK_LIMIT = 5;
 
-// ponytail: the last two labels stand for the site, so every `.ac.uk` host counts as one. A public-suffix list if a wrong file gets through.
-const site = (url: URL) => url.hostname.split(".").slice(-2).join(".");
+/**
+ * The part of a host name that stands for the site. Under a country code, a short label before it (`ac.uk`,
+ * `edu.au`, `gov.pl`, `co.jp`) is the registry's and not the site's, so one more label is kept.
+ * ponytail: a rule of thumb. The public-suffix list if a wrong file gets through on a host it misjudges.
+ */
+function site(url: URL) {
+	const labels = url.hostname.split(".");
+	const registry = labels.length >= 3 && labels.at(-1)!.length === 2 && labels.at(-2)!.length <= 3;
+	return labels.slice(registry ? -3 : -2).join(".");
+}
 
 // A site's own documents, which a paper's page links to beside the paper.
 const SITE_DOCUMENT = /licen[sc]e|permission|terms|conditions|voorwaarden|polic(?:y|ies)|guidelines?|instructions?|template|faq|copyright|checklist|brochure|flyer/iu;

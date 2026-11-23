@@ -41,6 +41,11 @@ export type DownloadSettings = {
 	deadline?: number;
 	/** Called once the first bytes show a PDF is arriving. */
 	onPdf?: () => void;
+	/**
+	 * Waits for the host's turn before each request, redirects included, and returns what to call when the request is
+	 * over. Returns why instead, when the host is being left alone.
+	 */
+	enter?: (host: string) => Promise<(() => void) | string>;
 };
 
 const MAX_REDIRECTS = 8;
@@ -87,11 +92,17 @@ export async function download(start: URL, settings: DownloadSettings, referer?:
 	if (settings.signal.aborted) stop.abort();
 
 	let url = start;
+	let leave: (() => void) | undefined;
 	try {
 		let response: Response;
 		for (let hop = 0; ; hop++) {
 			if (!isPublicUrl(url)) return { outcome: "unsafe", note: "Not a public address", url };
 			if (hop > MAX_REDIRECTS) return { outcome: "http", note: "Too many redirects", url };
+			leave?.();
+			leave = undefined;
+			const entered = await settings.enter?.(url.hostname);
+			if (typeof entered === "string") return { outcome: "skipped", note: entered, url };
+			leave = entered;
 			allow(ANSWER_MS);
 			response = await settings.fetch(url, {
 				// Some servers answer 404 or 406 to a strict Accept, though they serve the file to */*.
@@ -110,7 +121,8 @@ export async function download(start: URL, settings: DownloadSettings, referer?:
 			}
 		}
 
-		const declared = Number(response.headers.get("content-length")) || 0;
+		// The length of a compressed answer is not the length of the file, so it is not used to judge one.
+		const declared = response.headers.get("content-encoding") ? 0 : Number(response.headers.get("content-length")) || 0;
 		if (response.ok && declared > settings.maxBytes) {
 			await response.body?.cancel().catch(() => undefined);
 			return { outcome: "too_large", status: response.status, note: `${declared} bytes`, url };
@@ -182,6 +194,7 @@ export async function download(start: URL, settings: DownloadSettings, referer?:
 		if (settings.signal.aborted) return { outcome: "cancelled", note: "Stopped", url };
 		return { outcome: "network", note: errorNote(error), url };
 	} finally {
+		leave?.();
 		clearTimeout(timer);
 		settings.signal.removeEventListener("abort", ended);
 	}

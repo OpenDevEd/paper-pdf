@@ -74,7 +74,7 @@ test("the archive's saved copy of a refusal does not count against the archive",
 	expect(second).toMatchObject({ ok: true, source: "wayback" });
 });
 
-test("a saved page's links are read against the site it was saved from", async () => {
+test("a saved page's links are read against the site it was saved from, however many links failed before", async () => {
 	const { options } = await serve({
 		"repository.example/handle/1": challenge,
 		...archive({
@@ -83,17 +83,27 @@ test("a saved page's links are read against the site it was saved from", async (
 		}),
 	});
 
-	const result = await findPdf({ urls: ["https://repository.example/handle/1"] }, options);
+	// With the page itself, as many failed links as the archive is asked about.
+	const dead = ["https://a.example/1.pdf", "https://b.example/1.pdf", "https://c.example/1.pdf"];
+	const result = await findPdf({ urls: [...dead, "https://repository.example/handle/1"] }, options);
 
 	expect(result).toMatchObject({ ok: true, source: "wayback", url: "https://web.archive.org/web/20240101000000id_/https://repository.example/bitstreams/1/download" });
 });
 
 test("a figshare item, whose page needs a browser, is read from figshare's record of its files", async () => {
 	const { options } = await serve({
-		"doi.org/10.6084/m9.figshare.6470414": redirect("https://figshare.com/articles/journal_contribution/A_paper/6470414"),
-		"figshare.com/articles/journal_contribution/A_paper/6470414": page("<html><body><div id='root'></div></body></html>"),
-		"api.figshare.com/v2/articles/6470414": json({ files: [{ name: "data.csv", download_url: "https://ndownloader.figshare.com/files/1" }, { name: "paper.pdf", mimetype: "application/pdf", download_url: "https://ndownloader.figshare.com/files/2" }] }),
+		// With a version number after the item's own.
+		"doi.org/10.6084/m9.figshare.6470414": redirect("https://figshare.com/articles/journal_contribution/A_paper/6470414/2"),
+		"figshare.com/articles/journal_contribution/A_paper/6470414/2": page("<html><body><div id='root'></div></body></html>"),
+		"api.figshare.com/v2/articles/6470414": json({
+			files: [
+				{ name: "data.csv", download_url: "https://ndownloader.figshare.com/files/1" },
+				{ name: "supplement.pdf", mimetype: "application/pdf", download_url: "https://ndownloader.figshare.com/files/3" },
+				{ name: "paper.pdf", mimetype: "application/pdf", download_url: "https://ndownloader.figshare.com/files/2" },
+			],
+		}),
 		"ndownloader.figshare.com/files/2": pdf(),
+		"ndownloader.figshare.com/files/3": pdf(),
 	});
 
 	const result = await findPdf({ doi: "10.6084/m9.figshare.6470414" }, options);
@@ -118,22 +128,54 @@ test("Crossref is asked once the caller's link fails", async () => {
 		"publisher.example/files/x.pdf": pdf(),
 	});
 
-	const result = await findPdf({ doi: "https://doi.org/10.1/X", urls: ["https://publisher.example/gone.pdf"] }, options);
+	// The ID and the links say the caller holds OpenAlex's record, whose links are Unpaywall's.
+	const result = await findPdf({ doi: "https://doi.org/10.1/X", openalexId: "W1", urls: ["https://publisher.example/gone.pdf"] }, options);
 
 	expect(result).toMatchObject({ ok: true, source: "crossref", url: "https://publisher.example/files/x.pdf?a=1&b=2" });
 	expect(result.attempts).toContainEqual(expect.objectContaining({ source: "crossref", outcome: "lookup", note: "1 links" }));
 	expect(asked.filter((key) => key.startsWith("api.unpaywall.org"))).toEqual([]);
 });
 
-test("a paper that came with no links is looked up in Unpaywall", async () => {
+test("a paper whose links are not OpenAlex's is looked up in Unpaywall", async () => {
 	const { options } = await serve({
 		"api.unpaywall.org/v2/10.1%2Fx": json({ oa_locations: [{ url_for_pdf: "https://repository.example/green.pdf" }] }),
 		"repository.example/green.pdf": pdf(),
 	});
 
-	const result = await findPdf({ doi: "10.1/x" }, options);
+	const result = await findPdf({ doi: "10.1/x", urls: ["https://publisher.example/gone.pdf"] }, options);
 
 	expect(result).toMatchObject({ ok: true, source: "unpaywall", url: "https://repository.example/green.pdf" });
+});
+
+test("the services are not asked while the caller's landing page is still answering", async () => {
+	const { asked, options } = await serve({
+		"publisher.example/article/1": delayed(page('<meta name="citation_pdf_url" content="/files/1.pdf">'), 100),
+		"publisher.example/files/1.pdf": pdf(),
+	});
+
+	const result = await findPdf({ doi: "10.1/x", urls: ["https://publisher.example/article/1"] }, options);
+
+	expect(result).toMatchObject({ ok: true, source: "page" });
+	expect(asked).toEqual(["publisher.example/article/1", "publisher.example/files/1.pdf"]);
+});
+
+test("a link that only mentions PubMed Central is fetched as it is", async () => {
+	const { asked, options } = await serve({ "publisher.example/a.pdf": pdf() });
+
+	const result = await findPdf({ urls: ["https://publisher.example/a.pdf?ref=https://pmc.ncbi.nlm.nih.gov/articles/PMC999/"] }, options);
+
+	expect(result.ok).toBe(true);
+	expect(asked).toEqual(["publisher.example/a.pdf?ref=https://pmc.ncbi.nlm.nih.gov/articles/PMC999/"]);
+});
+
+test("a host that cannot be reached stays worth a retry soon when the archive has no copy either", async () => {
+	const { options } = await serve({ ...archive({}) });
+	const down: typeof fetch = (input, init) => (new URL(input as string | URL).hostname === "down.example" ? Promise.reject(new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } })) : options.fetch!(input, init));
+
+	const result = await findPdf({ urls: ["https://down.example/a.pdf"] }, { ...options, fetch: down });
+
+	expect(result).toMatchObject({ ok: false, reason: "unreachable" });
+	expect(!result.ok && result.retryAt - Date.now()).toBeLessThan(2 * 3_600_000);
 });
 
 test("a PDF that was cut short is passed over", async () => {
@@ -262,6 +304,13 @@ test("OpenAlex's paid copy is bought only after every free copy failed, and its 
 	expect(paid).toMatchObject({ ok: true, source: "openalex-copy", url: "https://content.openalex.org/works/W1.pdf" });
 	expect(asked.at(-1)).toBe("content.openalex.org/works/W1.pdf?api_key=sekret");
 	expect(JSON.stringify(paid.attempts)).not.toContain("sekret");
+
+	// An error that quotes the address it failed on.
+	const failing: typeof fetch = (input, init) => (new URL(input as string | URL).hostname === "content.openalex.org" ? Promise.reject(new Error(`No route to ${new URL(input as string | URL).href}`)) : options.fetch!(input, init));
+	const failed = await findPdf(paper, { ...options, fetch: failing, openAlexKey: "sekret", buyOpenAlexCopy: true });
+
+	expect(failed.attempts).toContainEqual(expect.objectContaining({ source: "openalex-copy", outcome: "network" }));
+	expect(JSON.stringify(failed)).not.toContain("sekret");
 });
 
 test("OpenAlex's paid copy is not bought while a service may still name a free one", async () => {
@@ -278,6 +327,24 @@ test("OpenAlex's paid copy is not bought while a service may still name a free o
 
 	expect(result).toMatchObject({ ok: true, source: "crossref" });
 	expect(asked.filter((key) => key.startsWith("content.openalex.org"))).toEqual([]);
+});
+
+test("a caller's check that throws does not stop the search", async () => {
+	const { options } = await serve({ "publisher.example/a.pdf": pdf(), "repository.example/a.pdf": pdf() });
+
+	const result = await findPdf(
+		{ urls: ["https://publisher.example/a.pdf", "https://repository.example/a.pdf"] },
+		{
+			...options,
+			accept: ({ url }) => {
+				if (url.includes("publisher")) throw new Error("The parser crashed");
+				return undefined;
+			},
+		},
+	);
+
+	expect(result).toMatchObject({ ok: true, url: "https://repository.example/a.pdf" });
+	expect(result.attempts).toContainEqual(expect.objectContaining({ outcome: "rejected", note: "Failed: The parser crashed" }));
 });
 
 test("the search moves on when the caller says a PDF is not the paper", async () => {
