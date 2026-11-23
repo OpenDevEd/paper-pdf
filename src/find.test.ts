@@ -338,12 +338,20 @@ test("a supplement is not taken for the paper", async () => {
 });
 
 test("a file over the size limit is refused", async () => {
-	const { options } = await serve({ "publisher.example/a.pdf": pdf() });
+	const { options } = await serve({
+		"publisher.example/a.pdf": pdf(),
+		"publisher.example/small.pdf": pdf(Buffer.from("%PDF-1.7\n1 0 obj\n<<>>\nendobj\nxref\n0 1\n0000000000 65535 f \ntrailer\n<<>>\nstartxref\n29\n%%EOF\n")),
+	});
 
 	const result = await findPdf({ urls: ["https://publisher.example/a.pdf"] }, { ...options, maxBytes: 1_500 });
 
 	expect(result.ok).toBe(false);
 	expect(result.attempts).toContainEqual(expect.objectContaining({ outcome: "too_large" }));
+
+	// A file so small that it ends before its first bytes are looked at.
+	const small = await findPdf({ urls: ["https://publisher.example/small.pdf"] }, { ...options, maxBytes: 50 });
+
+	expect(small.attempts).toContainEqual(expect.objectContaining({ outcome: "too_large" }));
 });
 
 test("a link that stalls does not hold up the next one", async () => {

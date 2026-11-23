@@ -177,6 +177,8 @@ export async function download(start: URL, settings: DownloadSettings, referer?:
 			}
 		}
 		if (kind === "unknown") kind = decide();
+		// A file that ended before it was sniffed was not measured in the loop above.
+		if (kind === "pdf" && size > settings.maxBytes) return { outcome: "too_large", status: response.status, note: `More than ${settings.maxBytes} bytes`, url };
 		const bytes = join(chunks, size);
 
 		if (kind === "pdf" && response.ok) {
