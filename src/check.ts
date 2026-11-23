@@ -35,7 +35,7 @@ export function isPublicUrl(url: URL): boolean {
 	const host = url.hostname.toLowerCase().replace(/\.$/u, "");
 	// No paper is served from an IPv6 address written out, or from a name without a dot.
 	if (host.startsWith("[") || !host.includes(".")) return false;
-	if (/\.(?:local|localhost|internal|lan|home|corp|test|invalid)$/u.test(host)) return false;
+	if (/\.(?:local|localhost|internal|lan|home|corp)$/u.test(host)) return false;
 	const v4 = /^(\d+)\.(\d+)\.\d+\.\d+$/u.exec(host);
 	if (!v4) return true;
 	const a = Number(v4[1]);
