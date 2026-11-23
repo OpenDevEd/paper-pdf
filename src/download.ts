@@ -29,7 +29,7 @@ export type Outcome =
 export type Fetched =
 	| { outcome: "pdf"; bytes: Uint8Array; url: URL }
 	| { outcome: "page"; html: string; url: URL }
-	| { outcome: Exclude<Outcome, "pdf" | "page">; status?: number; note: string; url: URL; hostRefused?: boolean };
+	| { outcome: Exclude<Outcome, "pdf" | "page">; status?: number; note: string; url: URL; hostRefused?: boolean; /** Seconds the host asked to be left alone. */ retryAfter?: number };
 
 export type DownloadSettings = {
 	fetch: typeof fetch;
@@ -37,8 +37,13 @@ export type DownloadSettings = {
 	maxBytes: number;
 	/** Ends the request: the search is over or out of time. */
 	signal: AbortSignal;
-	/** When the search runs out of time, as epoch milliseconds. A download that cannot finish by then is dropped early. */
-	deadline?: number;
+	/**
+	 * When the time for this download runs out, as epoch milliseconds, asked again as it arrives. A PDF that cannot
+	 * finish by then is dropped early.
+	 */
+	deadline?: () => number;
+	/** How long the host may take to answer, when shorter than the usual limit. */
+	answerMs?: number;
 	/** Called once the first bytes show a PDF is arriving. */
 	onPdf?: () => void;
 	/**
@@ -103,7 +108,7 @@ export async function download(start: URL, settings: DownloadSettings, referer?:
 			const entered = await settings.enter?.(url.hostname);
 			if (typeof entered === "string") return { outcome: "skipped", note: entered, url };
 			leave = entered;
-			allow(ANSWER_MS);
+			allow(settings.answerMs ?? ANSWER_MS);
 			response = await settings.fetch(url, {
 				// Some servers answer 404 or 406 to a strict Accept, though they serve the file to */*.
 				headers: { Accept: "application/pdf, text/html;q=0.9, */*;q=0.8", "User-Agent": settings.userAgent, ...(referer ? { Referer: referer.href } : {}) },
@@ -159,7 +164,7 @@ export async function download(start: URL, settings: DownloadSettings, referer?:
 			if (kind === "pdf" && spent > PACE_AFTER_MS) {
 				// At this pace the rest needs twice the time the search has left, so the time goes to another copy. A
 				// download that is only a little behind is kept: the Internet Archive starts slowly and speeds up.
-				const late = declared ? ((declared - size) * spent) / size > 2 * ((settings.deadline ?? Infinity) - Date.now()) : (size * 1_000) / spent < SLOWEST_BYTES_A_SECOND;
+				const late = declared ? ((declared - size) * spent) / size > 2 * ((settings.deadline?.() ?? Infinity) - Date.now()) : (size * 1_000) / spent < SLOWEST_BYTES_A_SECOND;
 				if (late) {
 					await reader.cancel().catch(() => undefined);
 					return { outcome: "timeout", status: response.status, note: "Too slow to finish in time", url };
@@ -185,7 +190,8 @@ export async function download(start: URL, settings: DownloadSettings, referer?:
 		if (refusal) return { outcome: "blocked", status: response.status, note: refusal, url, hostRefused: true };
 		if (!response.ok) {
 			const refused = response.status === 401 || response.status === 403 || response.status === 429;
-			return { outcome: refused ? "blocked" : "http", status: response.status, note: `HTTP ${response.status}`, url };
+			const wait = Number(response.headers.get("retry-after"));
+			return { outcome: refused ? "blocked" : "http", status: response.status, note: `HTTP ${response.status}`, url, ...(wait > 0 ? { retryAfter: Math.min(wait, 120) } : {}) };
 		}
 		if (kind === "page") return { outcome: "page", html, url };
 		return { outcome: "not_pdf", status: response.status, note: size ? `Not a PDF: ${type || "no content type"}` : "Empty answer", url };

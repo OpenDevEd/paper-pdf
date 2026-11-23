@@ -56,6 +56,10 @@ const REFUSED = "Private address is not allowed";
 const connect = buildConnector({
 	// Springer Nature's Fastly answers HTTP/1.1 requests from undici with a JavaScript challenge, but not HTTP/2 ones.
 	allowH2: true,
+	// Node tries a host's addresses in turn and gives each 250 ms by default. A journal's server on another
+	// continent, or a busy connection, takes longer than that to answer, and the request failed as a timeout
+	// after a quarter second for each address.
+	autoSelectFamilyAttemptTimeout: 2_000,
 	lookup(hostname, options, callback) {
 		lookup(hostname, { all: true }, (error, addresses) => {
 			if (error) return callback(error, "", 0);

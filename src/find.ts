@@ -9,10 +9,15 @@
  *   6. OpenAlex's own copy, which costs money, when the caller allows it and every free copy failed
  *
  * It stops at the first file that is a PDF and the paper.
+ *
+ * Thousands of papers at once take two passes. Steps 4 to 6 lean on services every search shares, which refuse
+ * bursts. A `quick` search stops after step 3 and the pages its links lead to, so an import runs at the speed of
+ * the papers' own hosts. The papers it misses go through a full search afterwards, in which each shared service is
+ * asked at a steady pace and a search waits its turn.
  */
 
 import { isSupplementUrl, looksLikePdfUrl, pdfLinks } from "./check.ts";
-import { download, type Fetched, type Outcome } from "./download.ts";
+import { download, type DownloadSettings, type Fetched, type Outcome } from "./download.ts";
 import { archivedFrom, type Candidate, given, listedFiles, LOOKUPS, normalizeDoi, openAlexCopy, openAlexWork, type Paper, RANK, rewritten, type Source, waybackCopy } from "./sources.ts";
 
 type Awaitable<T> = T | Promise<T>;
@@ -47,8 +52,11 @@ export type Options = {
 	accept?: (file: { bytes: Uint8Array; url: string; source: Source }) => Awaitable<string | undefined>;
 	/** Searches a paper OpenAlex calls closed. Off, such a paper with no link costs no request. */
 	searchClosed?: boolean;
-	/** Leaves sources out. The benchmark uses it to show what each one adds. */
-	without?: readonly Source[];
+	/**
+	 * Tries only the caller's links, the DOI and the PDFs their pages lead to: no service, no archive, no paid copy.
+	 * For the first pass over many papers. A quick miss is not remembered, so the full search can follow at once.
+	 */
+	quick?: boolean;
 	signal?: AbortSignal;
 };
 
@@ -74,24 +82,43 @@ const DAY = 24 * HOUR;
 const RETRY_AFTER: Record<MissReason, number> = { closed: 30 * DAY, blocked: 7 * DAY, no_pdf: 14 * DAY, unreachable: HOUR };
 const RETRY_LIMIT = 60 * DAY;
 
-const PER_HOST = 2;
+/** A host gets this many requests at a time from one process, as the Evidence Community import has run with. */
+const PER_HOST = 4;
+/**
+ * Services every search shares. They refuse bursts, so each is asked at a steady pace however many searches are
+ * running. Checked on 2026-11-23: the Internet Archive answered 120 questions of 120 at 1.5 a second and refused
+ * after 13 at 3 a second, and Crossref states 10 a second and 3 at once for a caller that gives an email.
+ */
+const PACED: Record<string, { everyMs: number; atOnce: number }> = {
+	"archive.org": { everyMs: 700, atOnce: 2 },
+	"api.crossref.org": { everyMs: 150, atOnce: 2 },
+};
+/** How long a paced service is left alone after a 429 that names no time. The archive answered again within 33 seconds. */
+const BACKOFF_MS = 30_000;
+/** What a quick search leaves out. */
+const SLOW: ReadonlySet<Source> = new Set<Source>(["unpaywall", "openalex", "crossref", "wayback", "openalex-copy"]);
 /** A host that showed a bot challenge is not asked again for this long. */
 const REFUSAL_MS = 6 * HOUR;
-/** After this many refusals or failed connections in a row, a host is left alone for `STRIKE_MS`. */
+/**
+ * After this many refusals or failed connections in a row, a host is left alone: for a minute the first time, and
+ * twice as long each time it fails again straight after, up to `STRIKE_MS`. A dead host soon costs nothing, and a
+ * network that dropped for a moment does not silence a host every paper leads through, such as doi.org.
+ */
 const STRIKES = 3;
 const STRIKE_MS = 30 * 60_000;
 const MAX_PAGE_DEPTH = 2;
-const MAX_WAYBACK = 4;
+const MAX_WAYBACK = 3;
 const LOOKUP_MS = 5_000;
 /** While a PDF is arriving, another copy starts beside it only after this many hedge intervals: the download is slow. */
 const SLOW_DELIVERY = 6;
 
-type Host = { active: number; waiting: (() => void)[]; strikes: number; until: number; note: string; remembered?: Promise<void> };
+type Host = { active: number; waiting: (() => void)[]; strikes: number; /** Times in a row it was left alone for striking out. */ outs: number; until: number; note: string; /** When a paced host may next be asked. */ next: number; remembered?: Promise<void> };
+// ponytail: one small record a host, kept for the life of the process. Prune the idle ones if a worker ever sees millions of hosts.
 const hosts = new Map<string, Host>();
 
 const hostOf = (name: string) => {
 	let host = hosts.get(name);
-	if (!host) hosts.set(name, (host = { active: 0, waiting: [], strikes: 0, until: 0, note: "" }));
+	if (!host) hosts.set(name, (host = { active: 0, waiting: [], strikes: 0, outs: 0, until: 0, note: "", next: 0 }));
 	return host;
 };
 
@@ -121,8 +148,8 @@ export async function findPdf(paper: Paper, options: Options = {}): Promise<Resu
 	const before = key ? asMiss(await options.memory?.get(key)) : undefined;
 	if (before && before.retryAt > started) return { ok: false, reason: before.reason, retryAt: before.retryAt, remembered: true, ms: 0, attempts: [] };
 	const result = await new Promise<Result>((resolve) => new Search(paper, options, started, resolve).start());
-	// A search the caller stopped says nothing about the paper.
-	if (key && options.memory && !options.signal?.aborted) {
+	// A search the caller stopped, or one that tried only the quick steps, says nothing final about the paper.
+	if (key && options.memory && !options.signal?.aborted && !options.quick) {
 		if (result.ok) {
 			if (before) await options.memory.set(key, null);
 		} else {
@@ -140,7 +167,10 @@ class Search {
 	private readonly attempts: Attempt[] = [];
 	private readonly ended = new AbortController();
 	private readonly timers = new Set<ReturnType<typeof setTimeout>>();
-	private readonly deadline: number;
+	/** Moves later by the time the search spends waiting for a host's turn. */
+	private deadline: number;
+	/** Requests waiting for a host's turn. */
+	private inLine = 0;
 	private readonly inFlight = new Map<Candidate, number>();
 	private readonly paper: Paper;
 	private readonly fetch: typeof fetch;
@@ -185,17 +215,23 @@ class Search {
 			this.lookups = "done";
 		}
 		this.addPaidCopy();
-		this.after(this.deadline - Date.now(), () => {
+		this.armBudget();
+		this.pump();
+	}
+
+	private armBudget() {
+		this.after(Math.max(100, this.deadline - Date.now()), () => {
+			// Time given back for waiting in line moved the deadline, and a request still in line will move it again.
+			if (Date.now() < this.deadline || this.inLine > 0) return this.armBudget();
 			this.outOfTime = true;
 			this.finish();
 		});
-		this.pump();
 	}
 
 	private readonly stopped = () => this.finish();
 
-	private uses(source: Source) {
-		return !this.options.without?.includes(source);
+	private skips(source: Source) {
+		return Boolean(this.options.quick) && SLOW.has(source);
 	}
 
 	private after(ms: number, run: () => void) {
@@ -209,10 +245,10 @@ class Search {
 	private add(candidate: Candidate) {
 		// The services write a DOI's link in several ways, and each leads to the same page.
 		const key = candidate.url.href.replace(/^https?:\/\/(?:dx\.)?doi\.org\//iu, "https://doi.org/");
-		if (this.done || !this.uses(candidate.source) || this.seen.has(key)) return;
+		if (this.done || this.skips(candidate.source) || this.seen.has(key)) return;
 		this.seen.add(key);
 		if (isSupplementUrl(candidate.url)) return;
-		const better = this.uses("given") ? rewritten(candidate.url) : undefined;
+		const better = rewritten(candidate.url);
 		// Just ahead of the link it stands in for.
 		if (better) this.add({ ...candidate, url: better, rank: candidate.rank - 0.5 });
 		this.queue.push(candidate);
@@ -269,7 +305,7 @@ class Search {
 
 	private startLookups() {
 		const settings = { contactEmail: this.options.contactEmail, openAlexKey: this.options.openAlexKey };
-		const lookups = LOOKUPS.filter((lookup) => this.uses(lookup.source) && lookup.applies(this.paper, settings));
+		const lookups = LOOKUPS.filter((lookup) => !this.skips(lookup.source) && lookup.applies(this.paper, settings));
 		this.lookups = "running";
 		void Promise.all(
 			lookups.map(async (lookup) => {
@@ -278,20 +314,11 @@ class Search {
 				try {
 					const { candidates, learned } = await lookup.run(this.paper, settings, async (url) => {
 						asked = url.href;
-						// A service that is slow to answer is not waited for: the search goes on with what the others found.
-						const slow = new AbortController();
-						const timer = setTimeout(() => slow.abort(), LOOKUP_MS);
-						const stop = () => slow.abort();
-						this.ended.signal.addEventListener("abort", stop, { once: true });
-						try {
-							// Read like any link: within the host's turn, each redirect checked, and no further than a page is read.
-							const answer = await download(url, { fetch: this.fetch, userAgent: this.userAgent, maxBytes: this.maxBytes, signal: slow.signal, enter: (host) => this.enter(host) });
-							if (answer.outcome !== "page") throw new Error("note" in answer ? answer.note : "Not JSON");
-							return JSON.parse(answer.html) as unknown;
-						} finally {
-							clearTimeout(timer);
-							this.ended.signal.removeEventListener("abort", stop);
-						}
+						// Read like any link: within the host's turn, each redirect checked, and no further than a page is read.
+						// A service that is slow to answer once its turn has come is not waited for.
+						const answer = await this.ask(url, { signal: this.ended.signal, answerMs: LOOKUP_MS });
+						if (answer.outcome !== "page") throw new Error("note" in answer ? answer.note : "Not JSON");
+						return JSON.parse(answer.html) as unknown;
 					});
 					Object.assign(this.paper, learned);
 					for (const candidate of candidates) this.add(candidate);
@@ -332,7 +359,7 @@ class Search {
 			const listed = listedFiles(fetched.html, fetched.url);
 			const archived = candidate.source === "wayback";
 			// A DOI or a handle may have led to a host that is better asked another way.
-			const better = this.uses("given") && !listed ? rewritten(fetched.url) : undefined;
+			const better = listed ? undefined : rewritten(fetched.url);
 			if (better) this.add({ ...candidate, url: better, rank: RANK.rewrite });
 			// A saved page's links are read against the site it was saved from, and their saved copies are asked for.
 			// A closed paper's page has no link to the paper, so a link that only reads as a PDF there is something else.
@@ -362,20 +389,36 @@ class Search {
 	 * copy that the archive does hold leads.
 	 */
 	private addWayback(candidate: Candidate, rank = RANK.wayback + Math.max(candidate.rank, 0) / 10, found = false) {
-		if (candidate.source === "wayback" || candidate.secret || (!found && this.waybacks >= MAX_WAYBACK) || !this.uses("wayback")) return;
+		if (candidate.source === "wayback" || candidate.secret || (!found && this.waybacks >= MAX_WAYBACK) || this.skips("wayback")) return;
+		// The archive keeps a DOI link's redirect, not a paper: in two benchmark runs no find came from asking about one.
+		if (/^(?:dx\.)?doi\.org$/iu.test(candidate.url.hostname)) return;
 		const index = waybackCopy(candidate.url);
 		if (this.seen.has(index.href)) return;
 		if (!found) this.waybacks++;
 		this.add({ url: index, source: "wayback", rank, depth: candidate.depth });
 	}
 
+	/** One request. A paced service that says it is getting too many is left alone by every search for a while, then asked once more. */
+	private async ask(url: URL, settings: Pick<DownloadSettings, "signal" | "deadline" | "answerMs" | "onPdf">, referer?: URL): Promise<Fetched> {
+		const all = { ...settings, fetch: this.fetch, userAgent: this.userAgent, maxBytes: this.maxBytes, enter: (host: string) => this.enter(host) };
+		const fetched = await download(url, all, referer);
+		if (!(fetched.url.hostname in PACED) || fetched.outcome !== "blocked" || fetched.status !== 429) return fetched;
+		const host = hostOf(fetched.url.hostname);
+		host.next = Math.max(host.next, Date.now() + (fetched.retryAfter ? fetched.retryAfter * 1_000 : BACKOFF_MS));
+		return download(url, all, referer);
+	}
+
 	/**
-	 * Waits for a host's turn: at most `PER_HOST` requests at a time in this process. Says why instead when the host
-	 * is being left alone, by what this process saw or by what the shared memory holds.
+	 * Waits for a host's turn: a few requests at a time in this process, and for a paced service a steady pace as
+	 * well. Says why instead when the host is being left alone, by what this process saw or by what the shared
+	 * memory holds.
 	 */
 	private async enter(name: string): Promise<(() => void) | string> {
+		const began = Date.now();
 		const host = hostOf(name);
+		const paced = PACED[name];
 		const { memory } = this.options;
+		this.inLine++;
 		if (memory) {
 			// Read once a process, and waited for by every search that asks meanwhile. A memory that fails is read as empty.
 			host.remembered ??= Promise.resolve(memory.get(`host:${name}`)).then(
@@ -387,12 +430,31 @@ class Search {
 			);
 			await host.remembered;
 		}
-		while (host.active >= PER_HOST) await new Promise<void>((wake) => host.waiting.push(wake));
+		while (host.active >= (paced?.atOnce ?? PER_HOST)) await new Promise<void>((wake) => host.waiting.push(wake));
 		const leave = () => {
 			host.active--;
 			host.waiting.shift()?.();
 		};
 		host.active++;
+		if (paced) {
+			const turn = Math.max(host.next, Date.now());
+			host.next = turn + paced.everyMs;
+			// Ends early when the search does, so nothing is left waiting.
+			if (turn > Date.now()) {
+				await new Promise<void>((resolve) => {
+					const over = () => {
+						clearTimeout(timer);
+						this.ended.signal.removeEventListener("abort", over);
+						resolve();
+					};
+					const timer = setTimeout(over, turn - Date.now());
+					this.ended.signal.addEventListener("abort", over, { once: true });
+				});
+			}
+		}
+		// Time in line is the host's limit and not the paper's, so the search gets it back.
+		this.deadline += Date.now() - began;
+		this.inLine--;
 		// Checked after the wait: the host may have refused another paper meanwhile.
 		if (host.until > Date.now() || this.done) {
 			leave();
@@ -406,15 +468,12 @@ class Search {
 		const { memory } = this.options;
 		let delivering = false;
 		try {
-			const fetched = await download(
+			const fetched = await this.ask(
 				candidate.url,
 				{
-					fetch: this.fetch,
-					userAgent: this.userAgent,
-					maxBytes: this.maxBytes,
 					signal: this.ended.signal,
-					deadline: this.deadline,
-					enter: (host) => this.enter(host),
+					// A slow download is dropped only for the sake of another free copy. With none left to try, it runs until time is up.
+					deadline: () => (this.lookups !== "done" || this.queue.some((waiting) => waiting.rank < RANK.paid) ? this.deadline : Infinity),
 					onPdf: () => {
 						delivering = true;
 						this.delivering++;
@@ -430,9 +489,9 @@ class Search {
 				Object.assign(answered, { until: Date.now() + REFUSAL_MS, note: fetched.note });
 				await memory?.set(`host:${fetched.url.hostname}`, { until: answered.until, note: answered.note });
 			} else if (refused) {
-				if (++answered.strikes >= STRIKES) Object.assign(answered, { strikes: 0, until: Date.now() + STRIKE_MS, note: fetched.note });
-			} else if (fetched.outcome !== "cancelled" && fetched.outcome !== "timeout") {
-				answered.strikes = 0;
+				if (++answered.strikes >= STRIKES) Object.assign(answered, { strikes: 0, until: Date.now() + Math.min(STRIKE_MS, 60_000 * 2 ** answered.outs++), note: fetched.note });
+			} else if (fetched.outcome !== "cancelled" && fetched.outcome !== "timeout" && fetched.outcome !== "skipped") {
+				Object.assign(answered, { strikes: 0, outs: 0 });
 			}
 			return fetched;
 		} finally {
@@ -457,6 +516,7 @@ class Search {
 		else if (tried.some((attempt) => attempt.outcome === "blocked" || attempt.outcome === "skipped")) reason = "blocked";
 		else if (tried.length === 0) reason = this.paper.openAccess === false ? "closed" : "no_pdf";
 		else if (tried.every((attempt) => attempt.outcome === "network" || attempt.outcome === "timeout")) reason = "unreachable";
-		this.resolve({ ok: false, reason, retryAt: Date.now() + RETRY_AFTER[reason], remembered: false, ms, attempts });
+		// A quick miss is worth the full search at once.
+		this.resolve({ ok: false, reason, retryAt: Date.now() + (this.options.quick ? 0 : RETRY_AFTER[reason]), remembered: false, ms, attempts });
 	}
 }

@@ -27,7 +27,23 @@ A search stops at the first file that is a whole PDF and the paper.
 6. **The Internet Archive's saved copy** of a link whose host refused the request or lost the file.
 7. **OpenAlex's own copy**, when `buyOpenAlexCopy` is set and every free copy has failed. OpenAlex charges for each download.
 
-Up to three links are tried side by side. The second starts when the first has delivered no PDF after 1.5 seconds, or after 9 seconds when a PDF is arriving slowly. A host gets at most two requests at a time from one process, redirects included.
+Up to three links are tried side by side. The second starts when the first has delivered no PDF after 1.5 seconds, or after 9 seconds when a PDF is arriving slowly. A host gets at most four requests at a time from one process, redirects included.
+
+## Many papers at once
+
+Steps 4, 6 and 7 lean on services every search shares, and those refuse bursts. The Internet Archive answered 120 questions of 120 at 1.5 a second and refused after 13 at 3 a second. Crossref states 10 a second. So thousands of papers take two passes:
+
+```ts
+// During the import, as many at a time as its lanes allow: the papers' own links and what their pages lead to.
+const first = await findPdf(paper, { ...options, quick: true });
+
+// Afterwards, in the background, for the papers the first pass missed.
+if (!first.ok) queue(() => findPdf(paper, options));
+```
+
+A quick search asks no service and no archive, so its speed is that of the papers' own hosts. Its miss is not remembered, and the full search can follow at once.
+
+In the full search the package asks each shared service at a steady pace, however many searches are running: the Internet Archive once every 0.7 seconds, Crossref once every 0.15. A search waits its turn, and the wait does not count against its `budgetMs`. A service that still answers 429 is left alone by every search for the time it names, or 30 seconds, and asked once more. The pace is kept per process, so one worker should run the background pass.
 
 ## What a search returns
 
@@ -62,7 +78,8 @@ The package keeps no PDFs. The caller stores what it finds and reads its own sto
 | `contactEmail` | none | Unpaywall needs it and is skipped without it. |
 | `openAlexKey` | none | Reads the paper's OpenAlex record when the caller does not hold it. |
 | `buyOpenAlexCopy` | off | Downloads OpenAlex's paid copy as the last step. |
-| `budgetMs` | 45,000 | The longest one search may take. |
+| `budgetMs` | 45,000 | The longest one search may take, not counting time spent waiting for a host's turn. |
+| `quick` | off | Tries only the caller's links, the DOI and the PDFs their pages lead to. For the first pass over many papers. |
 | `hedgeMs` | 1,500 | How long a link may go without delivering before the next starts beside it. |
 | `maxBytes` | 50 MiB | The largest file accepted. |
 | `accept` | none | Returns why a PDF is not the paper, and the search moves on. `articleProblem({ pages, text })` knows preprint cover sheets and publisher previews. |
@@ -103,15 +120,26 @@ Run on 23 November 2026 from one laptop. Every found file was opened with pdf.js
 | --- | --- | --- |
 | Openscholar's `lib/pdf/download.ts` | 86 (34%) | 1.5 s |
 | Evidence Community's `pdf-download.ts` | 125 (50%) | 1.2 s |
-| This package, free copies only | 184 (74%) | 1.5 s |
+| This package, free copies only | 183 (73%) | 1.7 s |
 
-Of the 184, 116 came from the paper's own link, 26 from a PDF a page declared, 35 from the Internet Archive, 5 from the DOI's page and 2 from a link Crossref holds. Nine in ten finds took under 8 seconds, and a miss took a median of 3 seconds. A paper cost a median of 3 requests. By status: diamond 43 of 50, gold 46, hybrid 32, bronze 34, green 29.
+Of the 183, 118 came from the paper's own link, 26 from a PDF a page declared, 32 from the Internet Archive, 5 from the DOI's page and 2 from a link Crossref holds. Nine in ten finds took under 11 seconds, and a miss took a median of 1.4 seconds. A paper cost a median of 3 requests. By status: diamond 43 of 50, gold 46, hybrid 32, bronze 33, green 29.
 
-Of the 66 misses, 50 met a host that refuses scripts (Wiley, Elsevier, Taylor & Francis, Oxford, IOP, MDPI among them), and 27 have a copy OpenAlex sells.
+Of the 67 misses, 48 met a host that refuses scripts (Wiley, Elsevier, Taylor & Francis, Oxford, IOP, MDPI among them), and 28 have a copy OpenAlex sells.
 
-The first pages of 172 of the 179 files that have text carry the paper's title. The other 7 were not read by hand: six look like papers in Japanese, Ukrainian, Chinese or Arabic whose OpenAlex title is in another language, and one is a 90-page file that may be a whole journal issue.
+The first pages of 171 of the 178 files that have text carry the paper's title. The other 7 were not read by hand: six look like papers in Japanese, Ukrainian, Chinese or Arabic whose OpenAlex title is in another language, and one is a 90-page file that may be a whole journal issue.
 
-Five runs that day found between 180 and 185. A sixth, made while the laptop's connection was dropping, found 176.
+Runs that day found between 178 and 185 with a steady connection.
+
+**1,000 other random open-access articles, the way an import runs**, 200 of each status:
+
+| | Found | Time |
+| --- | --- | --- |
+| Evidence Community's `pdf-download.ts`, 48 at a time | 499 | 161 s |
+| This package, first pass: quick, 48 at a time | 584 | 138 s |
+| This package, second pass over the 416 misses: full, 8 at a time | 124 more | 585 s |
+| This package, both passes | 708 (71%) | |
+
+An earlier run of the same two passes found 709, with the first pass at 106 seconds. The Internet Archive was asked 560 questions, about one a second, and refused none. Before the pacing, one pass of everything at 48 at a time lost 25 of 184 finds on the 250-paper list to refusals.
 
 **93 open papers the Evidence Community downloader had failed on** (collected in October 2026): 50 found, 30 of them from the Internet Archive. All 43 misses have a copy OpenAlex sells. Runs ranged from 49 to 54.
 

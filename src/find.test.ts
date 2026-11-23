@@ -84,7 +84,7 @@ test("a saved page's links are read against the site it was saved from, however 
 	});
 
 	// With the page itself, as many failed links as the archive is asked about.
-	const dead = ["https://a.example/1.pdf", "https://b.example/1.pdf", "https://c.example/1.pdf"];
+	const dead = ["https://a.example/1.pdf", "https://b.example/1.pdf"];
 	const result = await findPdf({ urls: [...dead, "https://repository.example/handle/1"] }, options);
 
 	expect(result).toMatchObject({ ok: true, source: "wayback", url: "https://web.archive.org/web/20240101000000id_/https://repository.example/bitstreams/1/download" });
@@ -109,6 +109,59 @@ test("a figshare item, whose page needs a browser, is read from figshare's recor
 	const result = await findPdf({ doi: "10.6084/m9.figshare.6470414" }, options);
 
 	expect(result).toMatchObject({ ok: true, url: "https://ndownloader.figshare.com/files/2" });
+});
+
+test("a quick search asks no service and no archive, and the full search can follow at once", async () => {
+	const { asked, options } = await serve({
+		"api.crossref.org/works/10.1%2Fx": json({ message: { DOI: "10.1/x", link: [{ URL: "https://repository.example/x.pdf", "content-type": "application/pdf" }] } }),
+		"repository.example/x.pdf": pdf(),
+		...archive({ "https://publisher.example/gone.pdf": pdf() }),
+	});
+	const memory = new Map<string, unknown>();
+	const paper = { doi: "10.1/x", openalexId: "W1", urls: ["https://publisher.example/gone.pdf"] };
+
+	const quick = await findPdf(paper, { ...options, memory, quick: true });
+
+	expect(quick).toMatchObject({ ok: false, remembered: false });
+	expect(asked).toEqual(["publisher.example/gone.pdf", "doi.org/10.1/x"]);
+	expect([...memory.keys()].filter((key) => key.startsWith("paper:"))).toEqual([]);
+
+	const full = await findPdf(paper, { ...options, memory });
+
+	expect(full.ok).toBe(true);
+});
+
+test("a search that waits its turn for the archive does not run out of time", async () => {
+	const { options } = await serve({ ...archive({ "https://gone.example/a.pdf": pdf(), "https://gone.example/b.pdf": pdf() }) });
+	const began = Date.now();
+
+	// The archive is asked one question every 0.7 seconds, which is longer than either search may take.
+	const results = await Promise.all([
+		findPdf({ urls: ["https://gone.example/a.pdf"] }, { ...options, budgetMs: 500 }),
+		findPdf({ urls: ["https://gone.example/b.pdf"] }, { ...options, budgetMs: 500 }),
+	]);
+
+	expect(results).toMatchObject([{ ok: true, source: "wayback" }, { ok: true, source: "wayback" }]);
+	expect(Date.now() - began).toBeGreaterThan(600);
+});
+
+test("the archive asking for fewer requests is asked again after the time it names", async () => {
+	const copies = archive({ "https://gone.example/a.pdf": pdf() });
+	let refusals = 1;
+	const { asked, options } = await serve({
+		...copies,
+		"archive.org/wayback/available": (request, response) => {
+			if (refusals-- > 0) response.writeHead(429, { "retry-after": "1" }).end();
+			else copies["archive.org/wayback/available"]!(request, response);
+		},
+	});
+	const began = Date.now();
+
+	const result = await findPdf({ urls: ["https://gone.example/a.pdf"] }, options);
+
+	expect(result).toMatchObject({ ok: true, source: "wayback" });
+	expect(asked.filter((key) => key.startsWith("archive.org/wayback/available"))).toHaveLength(2);
+	expect(Date.now() - began).toBeGreaterThan(900);
 });
 
 test("a sign-in page at a PDF link is passed over, and a PDF with another content type is taken", async () => {
@@ -166,6 +219,20 @@ test("a link that only mentions PubMed Central is fetched as it is", async () =>
 
 	expect(result.ok).toBe(true);
 	expect(asked).toEqual(["publisher.example/a.pdf?ref=https://pmc.ncbi.nlm.nih.gov/articles/PMC999/"]);
+});
+
+test("a host that fails to connect three times in a row is left alone", async () => {
+	const { options } = await serve({});
+	let calls = 0;
+	const down: typeof fetch = (input, init) => {
+		if (new URL(input as string | URL).hostname !== "down.example") return options.fetch!(input, init);
+		calls++;
+		return Promise.reject(new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } }));
+	};
+
+	for (const name of ["a", "b", "c", "d", "e"]) await findPdf({ urls: [`https://down.example/${name}.pdf`] }, { ...options, fetch: down, quick: true });
+
+	expect(calls).toBe(3);
 });
 
 test("a host that cannot be reached stays worth a retry soon when the archive has no copy either", async () => {
