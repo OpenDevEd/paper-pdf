@@ -1,0 +1,49 @@
+{
+  "name": "@opendeved/paper-pdf",
+  "version": "0.1.0",
+  "description": "Finds and downloads a paper's open PDF, shared by Openscholar and Evidence Community.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "clean": "node -e \"import('node:fs').then(({ rmSync }) => rmSync('dist', { recursive: true, force: true }))\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "lint": "oxlint --type-aware --deny-warnings src bench",
+    "prepare": "npm run build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run lint && npm run typecheck && npm test && npm run build",
+    "bench": "node bench/run.ts"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "undici": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "oxlint": "^1.95.0",
+    "oxlint-tsgolint": "^7.0.2008",
+    "pdfjs-dist": "^6.5.438",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.1"
+  }
+}

@@ -1,0 +1,427 @@
+/**
+ * Finds one paper's PDF. The order is what keeps it fast:
+ *
+ *   1. what an earlier search remembered: a paper that had no copy is not searched again until its retry time
+ *   2. what the caller already knows: a closed paper with no link costs no request
+ *   3. the caller's own links, and nothing else while one of them is delivering a PDF
+ *   4. only once a link fails or is slow: Unpaywall, OpenAlex and Crossref, asked at the same time
+ *   5. PDFs that pages link to, and the Internet Archive's copy of a link whose host refused or lost the file
+ *   6. OpenAlex's own copy, which costs money, when the caller allows it and every free copy failed
+ *
+ * It stops at the first file that is a PDF and the paper.
+ */
+
+import { isPublicUrl, isSupplementUrl, looksLikePdfUrl, pdfLinks } from "./check.ts";
+import { download, type Fetched, type Outcome } from "./download.ts";
+import { archivedFrom, type Candidate, given, listedFiles, LOOKUPS, normalizeDoi, openAlexCopy, openAlexWork, type Paper, RANK, rewritten, type Source, waybackCopy } from "./sources.ts";
+
+type Awaitable<T> = T | Promise<T>;
+
+/**
+ * Where misses and refusing hosts are remembered between searches. A `Map` works for one process. A product passes
+ * its own store so every server and both products share what was learned. Values are plain JSON.
+ */
+export type Memory = { get(key: string): Awaitable<unknown>; set(key: string, value: unknown): Awaitable<unknown> };
+
+export type Options = {
+	/** Defaults to the global `fetch`. On Node pass `publicFetch` from `@opendeved/paper-pdf/node`, which also refuses names that resolve to private addresses. */
+	fetch?: typeof fetch;
+	/**
+	 * How requests name the caller, such as "ExampleBot/1.0 (+https://example.org/bot)". Leave "Mozilla" out: Springer,
+	 * BMC, HAL and sites behind Anubis challenge names that look like a browser and serve a plainly named bot.
+	 */
+	userAgent?: string;
+	/** Unpaywall needs it and is skipped without it. Crossref answers faster with it. */
+	contactEmail?: string;
+	/** Reads the paper's OpenAlex record when the caller passed no links. */
+	openAlexKey?: string;
+	/** With `openAlexKey`, downloads OpenAlex's own copy once every free copy has failed. OpenAlex charges for each. */
+	buyOpenAlexCopy?: boolean;
+	/** The longest one search may take. */
+	budgetMs?: number;
+	/** How long a link may go without delivering a PDF before the next one starts beside it. */
+	hedgeMs?: number;
+	maxBytes?: number;
+	memory?: Memory;
+	/** Says why a PDF is not the paper, so the search moves on. `articleProblem` judges extracted text. */
+	accept?: (file: { bytes: Uint8Array; url: string; source: Source }) => Awaitable<string | undefined>;
+	/** Searches a paper OpenAlex calls closed. Off, such a paper with no link costs no request. */
+	searchClosed?: boolean;
+	/** Leaves sources out. The benchmark uses it to show what each one adds. */
+	without?: readonly Source[];
+	signal?: AbortSignal;
+};
+
+export type Attempt = { url: string; source: Source; outcome: Outcome; status?: number; note?: string; ms: number };
+
+export type MissReason =
+	/** Not open access and no link to try. Only an upload or a paid copy can help. */
+	| "closed"
+	/** A copy exists and its host refuses automated requests. */
+	| "blocked"
+	/** Every link answered and none was the paper. */
+	| "no_pdf"
+	/** Hosts did not answer, or time ran out. */
+	| "unreachable";
+
+export type Found = { ok: true; bytes: Uint8Array; url: string; source: Source; ms: number; attempts: Attempt[] };
+export type Missed = { ok: false; reason: MissReason; /** When a new search is worth it, as epoch milliseconds. */ retryAt: number; /** Answered from memory, with no request made. */ remembered: boolean; ms: number; attempts: Attempt[] };
+export type Result = Found | Missed;
+
+const HOUR = 3_600_000;
+const DAY = 24 * HOUR;
+/** How long a miss stands before the paper is searched again. Each further miss doubles it, up to `RETRY_LIMIT`. */
+const RETRY_AFTER: Record<MissReason, number> = { closed: 30 * DAY, blocked: 7 * DAY, no_pdf: 14 * DAY, unreachable: HOUR };
+const RETRY_LIMIT = 60 * DAY;
+
+const PER_HOST = 2;
+/** A host that showed a bot challenge is not asked again for this long. */
+const REFUSAL_MS = 6 * HOUR;
+/** After this many refusals or failed connections in a row, a host is left alone for `STRIKE_MS`. */
+const STRIKES = 3;
+const STRIKE_MS = 30 * 60_000;
+const MAX_PAGE_DEPTH = 2;
+const MAX_WAYBACK = 4;
+const LOOKUP_MS = 5_000;
+/** While a PDF is arriving, another copy starts beside it only after this many hedge intervals: the download is slow. */
+const SLOW_DELIVERY = 6;
+
+type Host = { active: number; waiting: (() => void)[]; strikes: number; until: number; note: string; asked: boolean };
+const hosts = new Map<string, Host>();
+
+const hostOf = (name: string) => {
+	let host = hosts.get(name);
+	if (!host) hosts.set(name, (host = { active: 0, waiting: [], strikes: 0, until: 0, note: "", asked: false }));
+	return host;
+};
+
+/** Forgets what this process learned about hosts. For tests. */
+export const forgetHosts = () => hosts.clear();
+
+/** The key a paper's miss is remembered under: write `null` to it when the paper's links change. */
+export function paperKey(paper: Paper): string | undefined {
+	const doi = normalizeDoi(paper.doi);
+	if (doi) return `paper:doi:${doi}`;
+	const work = openAlexWork(paper.openalexId);
+	if (work) return `paper:openalex:${work}`;
+	return paper.urls?.[0] ? `paper:url:${paper.urls[0]}` : undefined;
+}
+
+type Miss = { reason: MissReason; retryAt: number; tries: number };
+const asMiss = (value: unknown): Miss | undefined => {
+	const miss = value as Partial<Miss> | null;
+	return miss && typeof miss === "object" && typeof miss.reason === "string" && miss.reason in RETRY_AFTER && typeof miss.retryAt === "number"
+		? { reason: miss.reason, retryAt: miss.retryAt, tries: typeof miss.tries === "number" ? miss.tries : 1 }
+		: undefined;
+};
+
+export async function findPdf(paper: Paper, options: Options = {}): Promise<Result> {
+	const started = Date.now();
+	const key = paperKey(paper);
+	const before = key ? asMiss(await options.memory?.get(key)) : undefined;
+	if (before && before.retryAt > started) return { ok: false, reason: before.reason, retryAt: before.retryAt, remembered: true, ms: 0, attempts: [] };
+	const result = await new Promise<Result>((resolve) => new Search(paper, options, started, resolve).start());
+	// A search the caller stopped says nothing about the paper.
+	if (key && options.memory && !options.signal?.aborted) {
+		if (result.ok) {
+			if (before) await options.memory.set(key, null);
+		} else {
+			const tries = (before?.tries ?? 0) + 1;
+			result.retryAt = Date.now() + Math.min(RETRY_AFTER[result.reason] * 2 ** (tries - 1), RETRY_LIMIT);
+			await options.memory.set(key, { reason: result.reason, retryAt: result.retryAt, tries } satisfies Miss);
+		}
+	}
+	return result;
+}
+
+class Search {
+	private readonly queue: Candidate[] = [];
+	private readonly seen = new Set<string>();
+	private readonly attempts: Attempt[] = [];
+	private readonly ended = new AbortController();
+	private readonly timers = new Set<ReturnType<typeof setTimeout>>();
+	private readonly deadline: number;
+	private readonly inFlight = new Map<Candidate, number>();
+	private readonly paper: Paper;
+	private readonly fetch: typeof fetch;
+	private readonly userAgent: string;
+	private readonly hedgeMs: number;
+	private readonly maxBytes: number;
+	private running = 0;
+	/** Downloads whose first bytes are a PDF. While there is one, new copies start far more slowly. */
+	private delivering = 0;
+	private lastStart = 0;
+	private failed = false;
+	private lookups: "waiting" | "running" | "done" = "waiting";
+	private waybacks = 0;
+	private outOfTime = false;
+	private looking = false;
+	private done = false;
+	private readonly options: Options;
+	private readonly started: number;
+	private readonly resolve: (result: Result) => void;
+
+	constructor(paper: Paper, options: Options, started: number, resolve: (result: Result) => void) {
+		this.options = options;
+		this.started = started;
+		this.resolve = resolve;
+		this.paper = { ...paper };
+		this.fetch = options.fetch ?? fetch;
+		this.userAgent = options.userAgent ?? "paper-pdf/0.1";
+		this.hedgeMs = options.hedgeMs ?? 1_500;
+		this.maxBytes = options.maxBytes ?? 50 * 1024 * 1024;
+		this.deadline = started + (options.budgetMs ?? 45_000);
+	}
+
+	start() {
+		const { paper, options } = this;
+		if (options.signal?.aborted) return this.finish();
+		options.signal?.addEventListener("abort", () => this.finish(), { once: true });
+		for (const candidate of given(paper)) this.add(candidate);
+		const closed = paper.openAccess === false && !options.searchClosed && !paper.urls?.length && !paper.pmcid;
+		if (closed) {
+			// The DOI link of a closed paper leads to a paywall, and the services list no open copy of it.
+			this.queue.length = 0;
+			this.lookups = "done";
+		}
+		this.addPaidCopy();
+		this.after(this.deadline - Date.now(), () => {
+			this.outOfTime = true;
+			this.finish();
+		});
+		this.pump();
+	}
+
+	private uses(source: Source) {
+		return !this.options.without?.includes(source);
+	}
+
+	private after(ms: number, run: () => void) {
+		const timer = setTimeout(() => {
+			this.timers.delete(timer);
+			run();
+		}, ms);
+		this.timers.add(timer);
+	}
+
+	private add(candidate: Candidate) {
+		// The services write a DOI's link in several ways, and each leads to the same page.
+		const key = candidate.url.href.replace(/^https?:\/\/(?:dx\.)?doi\.org\//iu, "https://doi.org/");
+		if (this.done || !this.uses(candidate.source) || this.seen.has(key)) return;
+		this.seen.add(key);
+		if (isSupplementUrl(candidate.url)) return;
+		const better = this.uses("given") ? rewritten(candidate.url) : undefined;
+		// Just ahead of the link it stands in for.
+		if (better) this.add({ ...candidate, url: better, rank: candidate.rank - 0.5 });
+		this.queue.push(candidate);
+		// Stable, so links of one rank keep the order they were found in.
+		this.queue.sort((a, b) => a.rank - b.rank);
+	}
+
+	private addPaidCopy() {
+		const { openAlexKey, buyOpenAlexCopy } = this.options;
+		const work = openAlexWork(this.paper.openalexId);
+		if (!openAlexKey || !buyOpenAlexCopy || !work || this.paper.openAlexCopy === false) return;
+		this.add({ url: openAlexCopy(work, openAlexKey), source: "openalex-copy", rank: RANK.paid, depth: 0, secret: openAlexKey });
+	}
+
+	/** Starts what may start now, and ends the search when nothing is left. */
+	private pump() {
+		if (this.done) return;
+		const now = Date.now();
+		const promising = this.queue.some((candidate) => candidate.rank <= RANK.rewrite);
+		// The wait before something starts beside what is running. It is long while a PDF is arriving: most searches end there.
+		const wait = this.delivering ? this.hedgeMs * SLOW_DELIVERY : this.hedgeMs;
+		if (this.lookups === "waiting" && (this.failed || !promising || now - this.started >= wait)) this.startLookups();
+		while (this.running < 3 && (this.running === 0 || now - this.lastStart >= wait)) {
+			const next = this.queue[0];
+			// The paid copy waits until every free one has had its turn.
+			if (!next || (next.rank === RANK.paid && (this.running > 0 || this.lookups !== "done"))) break;
+			this.queue.shift();
+			this.running++;
+			this.lastStart = Date.now();
+			this.inFlight.set(next, this.lastStart);
+			void this.attempt(next).then(() => {
+				this.inFlight.delete(next);
+				this.running--;
+				this.pump();
+			});
+		}
+		if (this.running === 0 && this.queue.length === 0 && this.lookups === "done") return this.finish();
+		// Looks again once the wait is over, at a link that is slow to answer or to deliver.
+		if (!this.looking) {
+			this.looking = true;
+			this.after(wait, () => {
+				this.looking = false;
+				this.pump();
+			});
+		}
+	}
+
+	private startLookups() {
+		const settings = { contactEmail: this.options.contactEmail, openAlexKey: this.options.openAlexKey };
+		const lookups = LOOKUPS.filter((lookup) => this.uses(lookup.source) && lookup.applies(this.paper, settings));
+		this.lookups = "running";
+		void Promise.all(
+			lookups.map(async (lookup) => {
+				const began = Date.now();
+				let asked = "";
+				try {
+					const { candidates, learned } = await lookup.run(this.paper, settings, async (url) => {
+						asked = url.href;
+						// A service that is slow to answer is not waited for: the search goes on with what the others found.
+						const slow = new AbortController();
+						const timer = setTimeout(() => slow.abort(), LOOKUP_MS);
+						const stop = () => slow.abort();
+						this.ended.signal.addEventListener("abort", stop, { once: true });
+						try {
+							const response = await this.fetch(url, { headers: { Accept: "application/json", "User-Agent": this.userAgent }, signal: slow.signal });
+							if (!response.ok) throw new Error(`HTTP ${response.status}`);
+							return await response.json();
+						} finally {
+							clearTimeout(timer);
+							this.ended.signal.removeEventListener("abort", stop);
+						}
+					});
+					Object.assign(this.paper, learned);
+					for (const candidate of candidates) this.add(candidate);
+					this.note(asked, lookup.source, { outcome: "lookup", note: `${candidates.length} links` }, began, settings.openAlexKey);
+				} catch (error) {
+					if (!this.done) this.note(asked, lookup.source, { outcome: "lookup", note: `No answer: ${error instanceof Error ? error.message : String(error)}` }, began, settings.openAlexKey);
+				}
+			}),
+		).then(() => {
+			this.lookups = "done";
+			this.addPaidCopy();
+			this.pump();
+		});
+	}
+
+	private note(url: string, source: Source, result: { outcome: Outcome; status?: number; note?: string }, began: number, secret?: string) {
+		const shown = secret ? url.replaceAll(encodeURIComponent(secret), "…") : url;
+		this.attempts.push({ url: shown, source, outcome: result.outcome, ...(result.status ? { status: result.status } : {}), ...(result.note ? { note: result.note } : {}), ms: Date.now() - began });
+	}
+
+	private async attempt(candidate: Candidate) {
+		const began = Date.now();
+		const fetched = await this.fetchFromHost(candidate);
+		if (this.done) return;
+		const record = (result: { outcome: Outcome; status?: number; note?: string }) => this.note(candidate.url.href, candidate.source, result, began, candidate.secret);
+
+		if (fetched.outcome === "pdf") {
+			const problem = isSupplementUrl(fetched.url) ? "A supplement, not the paper" : await this.options.accept?.({ bytes: fetched.bytes, url: fetched.url.href, source: candidate.source });
+			if (this.done) return;
+			if (!problem) {
+				record({ outcome: "pdf" });
+				return this.finish({ bytes: fetched.bytes, url: candidate.secret ? candidate.url.origin + candidate.url.pathname : fetched.url.href, source: candidate.source });
+			}
+			return record({ outcome: "rejected", note: problem });
+		}
+		if (fetched.outcome === "page") {
+			const listed = listedFiles(fetched.html, fetched.url);
+			const archived = candidate.source === "wayback";
+			// A DOI or a handle may have led to a host that is better asked another way.
+			const better = this.uses("given") && !listed ? rewritten(fetched.url) : undefined;
+			if (better) this.add({ ...candidate, url: better, rank: RANK.rewrite });
+			// A saved page's links are read against the site it was saved from, and their saved copies are asked for.
+			// A closed paper's page has no link to the paper, so a link that only reads as a PDF there is something else.
+			const links = listed ?? (candidate.depth < MAX_PAGE_DEPTH ? pdfLinks(fetched.html, (archived && archivedFrom(fetched.url)) || fetched.url, this.paper.openAccess === false) : []);
+			// What a page or a listing leads to takes its place in the order.
+			const next = { rank: Math.min(candidate.rank, RANK.rewrite), depth: candidate.depth + (listed ? 0 : 1) };
+			for (const url of links) {
+				if (listed) this.add({ ...next, url, source: candidate.source, rank: candidate.rank });
+				else if (archived) this.addWayback({ ...next, url, source: "page" }, candidate.rank);
+				else this.add({ ...next, url, source: "page", referer: fetched.url });
+			}
+			record({ outcome: links.length ? "page" : "not_pdf", note: links.length ? `${links.length} links` : "No PDF link" });
+			// A PDF's own address that now serves a page: the archive may hold the file it used to serve.
+			if (!links.length && looksLikePdfUrl(candidate.url)) this.addWayback(candidate);
+			return;
+		}
+		record(fetched);
+		if (fetched.outcome === "cancelled" || fetched.outcome === "unsafe" || fetched.outcome === "too_large") return;
+		this.failed = true;
+		this.addWayback(candidate);
+	}
+
+	/** Asks the archive for its copy of a link that failed. A PDF's own address is worth more than a page's. */
+	private addWayback(candidate: Candidate, rank = RANK.wayback + Math.max(candidate.rank, 0) / 10) {
+		if (candidate.source === "wayback" || candidate.secret || this.waybacks >= MAX_WAYBACK || !this.uses("wayback")) return;
+		const index = waybackCopy(candidate.url);
+		if (this.seen.has(index.href)) return;
+		this.waybacks++;
+		this.add({ url: index, source: "wayback", rank, depth: candidate.depth });
+	}
+
+	/** One download, within the host's share of connections, unless the host is being left alone. */
+	private async fetchFromHost(candidate: Candidate): Promise<Fetched> {
+		const { url } = candidate;
+		const host = hostOf(url.hostname);
+		const { memory } = this.options;
+		if (!isPublicUrl(url)) return { outcome: "unsafe", note: "Not a public address", url };
+		if (!host.asked && memory) {
+			host.asked = true;
+			const kept = (await memory.get(`host:${url.hostname}`)) as { until?: unknown; note?: unknown } | null | undefined;
+			if (typeof kept?.until === "number" && kept.until > host.until) Object.assign(host, { until: kept.until, note: typeof kept.note === "string" ? kept.note : "" });
+		}
+		if (host.until > Date.now()) return { outcome: "skipped", note: `Host left alone: ${host.note}`, url };
+
+		while (host.active >= PER_HOST) await new Promise<void>((wake) => host.waiting.push(wake));
+		host.active++;
+		let delivering = false;
+		try {
+			if (this.done) return { outcome: "cancelled", note: "Stopped", url };
+			const fetched = await download(
+				url,
+				{
+					fetch: this.fetch,
+					userAgent: this.userAgent,
+					maxBytes: this.maxBytes,
+					signal: this.ended.signal,
+					deadline: this.deadline,
+					onPdf: () => {
+						delivering = true;
+						this.delivering++;
+					},
+				},
+				candidate.referer,
+			);
+			// What a host is judged by is where the redirects ended, which may be another host.
+			const answered = hostOf(fetched.url.hostname);
+			// A saved copy of a refusal says nothing about the archive that serves it. Only the archive asking for fewer requests does.
+			const refused = (fetched.outcome === "blocked" && (candidate.source !== "wayback" || fetched.status === 429)) || (fetched.outcome === "network" && /^(?:UND_ERR_CONNECT_TIMEOUT|ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN)$/u.test(fetched.note));
+			if (refused && fetched.outcome === "blocked" && fetched.hostRefused) {
+				Object.assign(answered, { until: Date.now() + REFUSAL_MS, note: fetched.note });
+				await memory?.set(`host:${fetched.url.hostname}`, { until: answered.until, note: answered.note });
+			} else if (refused) {
+				if (++answered.strikes >= STRIKES) Object.assign(answered, { strikes: 0, until: Date.now() + STRIKE_MS, note: fetched.note });
+			} else if (fetched.outcome !== "cancelled" && fetched.outcome !== "timeout") {
+				answered.strikes = 0;
+			}
+			return fetched;
+		} finally {
+			if (delivering) this.delivering--;
+			host.active--;
+			host.waiting.shift()?.();
+		}
+	}
+
+	private finish(found?: { bytes: Uint8Array; url: string; source: Source }) {
+		if (this.done) return;
+		this.done = true;
+		for (const timer of this.timers) clearTimeout(timer);
+		this.ended.abort();
+		const ms = Date.now() - this.started;
+		const { attempts } = this;
+		if (found) return this.resolve({ ok: true, ...found, ms, attempts });
+		for (const [candidate, began] of this.inFlight) this.note(candidate.url.href, candidate.source, { outcome: "timeout", note: "Still running when the search ended" }, began, candidate.secret);
+
+		const tried = attempts.filter((attempt) => attempt.outcome !== "lookup");
+		let reason: MissReason = "no_pdf";
+		if (this.outOfTime || this.options.signal?.aborted) reason = "unreachable";
+		else if (tried.some((attempt) => attempt.outcome === "blocked" || attempt.outcome === "skipped")) reason = "blocked";
+		else if (tried.length === 0) reason = this.paper.openAccess === false ? "closed" : "no_pdf";
+		else if (tried.every((attempt) => attempt.outcome === "network" || attempt.outcome === "timeout")) reason = "unreachable";
+		this.resolve({ ok: false, reason, retryAt: Date.now() + RETRY_AFTER[reason], remembered: false, ms, attempts });
+	}
+}
