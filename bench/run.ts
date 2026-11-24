@@ -63,7 +63,8 @@ if (flags.keep) mkdirSync("bench/pdfs", { recursive: true });
 
 async function run(paper: Listed, quick: boolean): Promise<Row> {
 	let opened: { pages: number; text: string } | undefined;
-	const result = await findPdf(paper, {
+	// A listed paper carries every link OpenAlex holds for it.
+	const result = await findPdf({ ...paper, openAlexLinks: true }, {
 		fetch: publicFetch,
 		userAgent: "OpenscholarBot/0.1 (+https://openscholar.ai)",
 		memory,

@@ -22,7 +22,7 @@ A search stops at the first file that is a whole PDF and the paper.
 1. **Memory.** A paper that had no copy last time is not searched again until its retry time. That answer costs no request.
 2. **What the caller knows.** A paper OpenAlex calls closed, with no link, costs no request either.
 3. **The caller's own links.** While one of them is delivering a PDF, nothing else is asked. A link to PubMed Central, figshare or an arXiv abstract is swapped for the address that serves the file to a script.
-4. **Services**, once a link fails or takes longer than 1.5 seconds: Crossref's registered full-text links, and Unpaywall and OpenAlex unless the caller already holds the paper's OpenAlex record (it passed OpenAlex's ID and links). They are asked at the same time.
+4. **Services**, once a link fails or takes longer than 1.5 seconds: Crossref's registered full-text links, and Unpaywall unless the caller says its links are all of OpenAlex's (`openAlexLinks`). OpenAlex's record is read where Unpaywall can't be asked. They are asked at the same time.
 5. **Pages.** A landing page's declared PDF (`citation_pdf_url`, a link of type PDF) is followed, then links on the page's own site that read as a PDF and are named one.
 6. **The Internet Archive's saved copy** of a link whose host refused the request or lost the file.
 7. **OpenAlex's own copy**, when `buyOpenAlexCopy` is set and every free copy has failed. OpenAlex charges for each download.
@@ -76,7 +76,7 @@ The package keeps no PDFs. The caller stores what it finds and reads its own sto
 | `fetch` | global `fetch` | On Node pass `publicFetch`, which also refuses names that resolve to private addresses. |
 | `userAgent` | `paper-pdf/0.1` | How requests name the caller. Leave "Mozilla" out (see below). |
 | `contactEmail` | none | Unpaywall needs it and is skipped without it. |
-| `openAlexKey` | none | Reads the paper's OpenAlex record when the caller does not hold it. |
+| `openAlexKey` | none | Reads the paper's OpenAlex record where Unpaywall can't be asked, as for a paper with no DOI. |
 | `buyOpenAlexCopy` | off | Downloads OpenAlex's paid copy as the last step. |
 | `budgetMs` | 45,000 | The longest one search may take, not counting time spent waiting for a host's turn. |
 | `quick` | off | Tries only the caller's links, the DOI and the PDFs their pages lead to. For the first pass over many papers. |

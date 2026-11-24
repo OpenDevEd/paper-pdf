@@ -21,6 +21,11 @@ export type Paper = {
 	pmcid?: string | undefined;
 	/** Links the caller already holds, best first. */
 	urls?: readonly string[] | undefined;
+	/**
+	 * The links are every copy OpenAlex lists for the paper. Unpaywall and OpenAlex are then not asked: their copies
+	 * are the same ones, and for 343 such papers Unpaywall named no other.
+	 */
+	openAlexLinks?: boolean | undefined;
 	/** OpenAlex's `open_access.is_oa`. */
 	openAccess?: boolean | undefined;
 	/** OpenAlex's `has_content.pdf`: it keeps a copy, which costs money to download. */
@@ -147,10 +152,10 @@ export function rewritten(url: URL): URL | undefined {
 
 export const openAlexCopy = (work: string, key: string) => new URL(`https://content.openalex.org/works/${work}.pdf?api_key=${encodeURIComponent(key)}`);
 
-/** Whether the caller holds the paper's OpenAlex record: it passed OpenAlex's ID and links. Links alone may be from anywhere. */
-const fromOpenAlex = (paper: Paper) => Boolean(openAlexWork(paper.openalexId) && paper.urls?.length);
 
 export type LookupSettings = { contactEmail?: string | undefined; openAlexKey?: string | undefined };
+
+const asksUnpaywall = (paper: Paper, settings: LookupSettings) => Boolean(normalizeDoi(paper.doi) && settings.contactEmail);
 
 /** Reads a service's JSON answer, or nothing when it does not answer in time. */
 export type ReadJson = (url: URL) => Promise<unknown>;
@@ -160,10 +165,9 @@ type Lookup = { source: Source; applies: (paper: Paper, settings: LookupSettings
 
 export const LOOKUPS: Lookup[] = [
 	{
-		// Unpaywall asks callers to name themselves by email and refuses placeholders. It is not asked for a paper that
-		// came from OpenAlex with links: those links are Unpaywall's, and for 343 such papers it named no other copy.
+		// Unpaywall asks callers to name themselves by email and refuses placeholders.
 		source: "unpaywall",
-		applies: (paper, settings) => Boolean(normalizeDoi(paper.doi) && settings.contactEmail && !fromOpenAlex(paper)),
+		applies: (paper, settings) => !paper.openAlexLinks && asksUnpaywall(paper, settings),
 		async run(paper, settings, json) {
 			const url = new URL(`https://api.unpaywall.org/v2/${encodeURIComponent(normalizeDoi(paper.doi)!)}`);
 			url.searchParams.set("email", settings.contactEmail!);
@@ -177,9 +181,9 @@ export const LOOKUPS: Lookup[] = [
 		},
 	},
 	{
-		// Only for a caller that holds no OpenAlex record.
+		// OpenAlex's record is read only where Unpaywall can't be asked, as for a paper with no DOI: the copies are the same.
 		source: "openalex",
-		applies: (paper, settings) => Boolean(settings.openAlexKey && !fromOpenAlex(paper) && (openAlexWork(paper.openalexId) || normalizeDoi(paper.doi))),
+		applies: (paper, settings) => Boolean(!paper.openAlexLinks && !asksUnpaywall(paper, settings) && settings.openAlexKey && (openAlexWork(paper.openalexId) || normalizeDoi(paper.doi))),
 		async run(paper, settings, json) {
 			const work = openAlexWork(paper.openalexId);
 			const url = new URL(`https://api.openalex.org/works/${work ?? `doi:${encodeURI(normalizeDoi(paper.doi)!)}`}`);

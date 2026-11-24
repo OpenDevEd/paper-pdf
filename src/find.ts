@@ -38,7 +38,7 @@ export type Options = {
 	userAgent?: string;
 	/** Unpaywall needs it and is skipped without it. Crossref answers faster with it. */
 	contactEmail?: string;
-	/** Reads the paper's OpenAlex record when the caller passed no links. */
+	/** Reads the paper's OpenAlex record where Unpaywall can't be asked, and buys OpenAlex's copy with `buyOpenAlexCopy`. */
 	openAlexKey?: string;
 	/** With `openAlexKey`, downloads OpenAlex's own copy once every free copy has failed. OpenAlex charges for each. */
 	buyOpenAlexCopy?: boolean;

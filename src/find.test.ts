@@ -118,7 +118,7 @@ test("a quick search asks no service and no archive, and the full search can fol
 		...archive({ "https://publisher.example/gone.pdf": pdf() }),
 	});
 	const memory = new Map<string, unknown>();
-	const paper = { doi: "10.1/x", openalexId: "W1", urls: ["https://publisher.example/gone.pdf"] };
+	const paper = { doi: "10.1/x", openAlexLinks: true, urls: ["https://publisher.example/gone.pdf"] };
 
 	const quick = await findPdf(paper, { ...options, memory, quick: true });
 
@@ -204,8 +204,8 @@ test("Crossref is asked once the caller's link fails", async () => {
 		"publisher.example/files/x.pdf": pdf(),
 	});
 
-	// The ID and the links say the caller holds OpenAlex's record, whose links are Unpaywall's.
-	const result = await findPdf({ doi: "https://doi.org/10.1/X", openalexId: "W1", urls: ["https://publisher.example/gone.pdf"] }, options);
+	// The caller holds every copy OpenAlex lists, which are Unpaywall's.
+	const result = await findPdf({ doi: "https://doi.org/10.1/X", openAlexLinks: true, urls: ["https://publisher.example/gone.pdf"] }, options);
 
 	expect(result).toMatchObject({ ok: true, source: "crossref", url: "https://publisher.example/files/x.pdf?a=1&b=2" });
 	expect(result.attempts).toContainEqual(expect.objectContaining({ source: "crossref", outcome: "lookup", note: "1 links" }));
