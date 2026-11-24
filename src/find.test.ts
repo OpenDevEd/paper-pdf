@@ -111,6 +111,43 @@ test("a figshare item, whose page needs a browser, is read from figshare's recor
 	expect(result).toMatchObject({ ok: true, url: "https://ndownloader.figshare.com/files/2" });
 });
 
+test("an MDPI article, whose site refuses scripts, is read from MDPI's file host", async () => {
+	const { options } = await serve({
+		// The journal's DOIs say "met" and its files say "metals".
+		"doi.org/10.3390/met12030391": redirect("https://www.mdpi.com/2075-4701/12/3/391"),
+		"www.mdpi.com/2075-4701/12/3/391": page("Forbidden", 403),
+		"mdpi-res.com/d_attachment/metals/metals-12-00391/article_deploy/metals-12-00391.pdf": pdf(),
+		// A journal newer than the table, named as its DOIs are.
+		"www.mdpi.com/9999-9999/4/1/7/pdf": page("Forbidden", 403),
+		"mdpi-res.com/d_attachment/newjournal/newjournal-04-00007/article_deploy/newjournal-04-00007.pdf": pdf(),
+	});
+
+	const known = await findPdf({ doi: "10.3390/met12030391" }, { ...options, quick: true });
+	const newer = await findPdf({ doi: "10.3390/newjournal4010007", urls: ["https://www.mdpi.com/9999-9999/4/1/7/pdf?version=1"] }, { ...options, quick: true });
+
+	expect(known).toMatchObject({ ok: true, url: "https://mdpi-res.com/d_attachment/metals/metals-12-00391/article_deploy/metals-12-00391.pdf" });
+	expect(newer).toMatchObject({ ok: true, url: "https://mdpi-res.com/d_attachment/newjournal/newjournal-04-00007/article_deploy/newjournal-04-00007.pdf" });
+});
+
+test("an IEEE paper, whose page a script draws, is read from Xplore's file address", async () => {
+	const { asked, options } = await serve({
+		"doi.org/10.1109/access.2024.3419561": redirect("https://ieeexplore.ieee.org/document/10571948/"),
+		"ieeexplore.ieee.org/document/10571948/": page(""),
+		"ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber=10571948&ref=": pdf(),
+		// A closed paper's file address leads back to its page.
+		"doi.org/10.1109/jsen.2019.2940376": redirect("https://ieeexplore.ieee.org/document/8832227/"),
+		"ieeexplore.ieee.org/document/8832227/": page(""),
+		"ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber=8832227&ref=": redirect("https://ieeexplore.ieee.org/document/8832227/"),
+	});
+
+	const open = await findPdf({ doi: "10.1109/access.2024.3419561" }, { ...options, quick: true });
+	const closed = await findPdf({ doi: "10.1109/jsen.2019.2940376" }, { ...options, quick: true });
+
+	expect(open).toMatchObject({ ok: true, url: "https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber=10571948&ref=" });
+	expect(closed).toMatchObject({ ok: false, reason: "no_pdf" });
+	expect(asked.filter((address) => address.includes("arnumber=8832227"))).toHaveLength(1);
+});
+
 test("a quick search asks no service and no archive, and the full search can follow at once", async () => {
 	const { asked, options } = await serve({
 		"api.crossref.org/works/10.1%2Fx": json({ message: { DOI: "10.1/x", link: [{ URL: "https://repository.example/x.pdf", "content-type": "application/pdf" }] } }),

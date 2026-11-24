@@ -91,11 +91,26 @@ export function blockReason(headers: Headers, html: string): string | undefined 
 	if (text.includes("_incapsula_resource")) return "Imperva challenge";
 	if (text.includes("captcha-delivery.com")) return "DataDome challenge";
 	if (title === "access denied" && text.includes("errors.edgesuite.net")) return "Akamai refusal";
+	if (title === "bot detection" && text.includes("capjs")) return "Cap proof of work";
+	if (title === "please wait" && text.includes("/assets/challenge-")) return "Thieme challenge";
 	return undefined;
 }
 
-const decodeEntities = (value: string) =>
-	value.replaceAll("&amp;", "&").replaceAll("&#38;", "&").replaceAll("&#x26;", "&").replaceAll("&quot;", '"').trim();
+/**
+ * A link as a page wrote it, made readable: HTML's escapes undone, an address escaped whole (`https%3A%2F%2F...`)
+ * unescaped, and the first of two addresses run together dropped, as CLOCKSS writes its archived journals' PDFs.
+ */
+function written(value: string) {
+	let link = value.replaceAll("&amp;", "&").replaceAll("&#38;", "&").replaceAll("&#x26;", "&").replaceAll("&quot;", '"').trim();
+	if (/^https?%3A%2F%2F/iu.test(link)) {
+		try {
+			link = decodeURIComponent(link);
+		} catch {
+			// Escapes that are not text leave the link as written.
+		}
+	}
+	return link.replace(/^https?:\/\/[^/?#]*(?=https?:\/\/)/iu, "");
+}
 
 const attribute = (tag: string, name: string) =>
 	new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, "iu").exec(tag)?.slice(1).find((value) => value !== undefined);
@@ -118,9 +133,10 @@ const SITE_DOCUMENT = /licen[sc]e|permission|terms|conditions|voorwaarden|polic(
 
 /**
  * The PDFs a page links to, likeliest first: what it declares to indexers (`citation_pdf_url`, an alternate link
- * of type PDF), where it sends the browser next, then links that both read as a PDF and are named one. At most
- * five. With `declaredOnly`, the links are left out. A link counts on the page's own site alone, and not when it
- * names a site document: an article page also links to the PDFs it cites, to its terms and to its author guidelines.
+ * of type PDF), where it sends the browser next, then links that both read as a PDF and are named one, by their
+ * text, their title or the icon inside them. At most five. With `declaredOnly`, the links are left out. A link
+ * counts on the page's own site alone, and not when it names a site document: an article page also links to the
+ * PDFs it cites, to its terms and to its author guidelines.
  */
 export function pdfLinks(html: string, base: URL, declaredOnly = false): URL[] {
 	const found: string[] = [];
@@ -135,16 +151,30 @@ export function pdfLinks(html: string, base: URL, declaredOnly = false): URL[] {
 		if (!/^refresh$/iu.test(attribute(tag, "http-equiv") ?? "")) continue;
 		found.push(/url\s*=\s*['"]?([^'"]+)/iu.exec(attribute(tag, "content") ?? "")?.[1] ?? "");
 	}
+	// Crossref's page for a DOI registered at several addresses lists them, and each is the paper's page somewhere.
+	if (base.hostname === "chooser.crossref.org") {
+		for (const tag of html.match(/<a\b[^>]*>/giu) ?? []) {
+			const href = attribute(tag, "href") ?? "";
+			if (/^https?:\/\//iu.test(href) && !/^https?:\/\/(?:[^/]*\.)?(?:crossref|doi)\.org(?:\/|$)/iu.test(href)) found.push(href);
+		}
+	}
 	const declared = found.length;
 	if (!declaredOnly) {
-		const reads = (href: string) => /\.pdf(?:$|[?#])|\/pdf(?:\/|$)|viewcontent\.cgi|\/bitstreams?\/|\/download\//iu.test(href);
+		// An address that ends as a PDF, holds one in a known folder, or says both that it downloads and that it is a PDF.
+		const reads = (href: string) => /\.pdf(?:$|[?#&])|\/pdf(?:\/|$)|viewcontent\.cgi|\/bitstreams?\/|\/download\/|download.*pdf|pdf.*download/iu.test(href);
 		for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]{0,300}?)<\/a>/giu)) {
-			const href = attribute(match[1] ?? "", "href") ?? "";
-			const text = (match[2] ?? "").replace(/<[^>]*>/gu, " ");
-			const named = /\bpdf\b|full[\s-]*text|download/iu.test(text) || /pdf/iu.test(attribute(match[1] ?? "", "class") ?? "");
-			if (reads(href) && named && !SITE_DOCUMENT.test(text) && !SITE_DOCUMENT.test(href.split("/").at(-1) ?? "")) found.push(href);
+			const [, tag = "", inside = ""] = match;
+			const href = attribute(tag, "href") ?? "";
+			const text = inside.replace(/<[^>]*>/gu, " ");
+			// A link drawn as an icon has no text: its title, or the icon's own name, says what it is.
+			const marks = [attribute(tag, "class"), attribute(tag, "title"), attribute(tag, "aria-label"), ...(inside.match(/<[^>]*>/gu) ?? [])].join(" ");
+			const named = /\bpdf\b|full[\s-]*text|download/iu.test(text) || /pdf/iu.test(marks);
+			if (reads(href) && named && !SITE_DOCUMENT.test(text) && !SITE_DOCUMENT.test(marks) && !SITE_DOCUMENT.test(href.split("/").at(-1) ?? "")) found.push(href);
 		}
-		for (const match of html.matchAll(/<(?:embed|iframe|object)\b[^>]*?\b(?:src|data)\s*=\s*["']([^"']*\.pdf[^"']*)["']/giu)) found.push(match[1] ?? "");
+		for (const tag of html.match(/<(?:embed|iframe|object)\b[^>]*>/giu) ?? []) {
+			const file = attribute(tag, "src") ?? attribute(tag, "data") ?? "";
+			if (/\.pdf/iu.test(file)) found.push(file);
+		}
 	}
 
 	const links = new Map<string, URL>();
@@ -152,7 +182,7 @@ export function pdfLinks(html: string, base: URL, declaredOnly = false): URL[] {
 		if (!value || /^(?:javascript:|mailto:|#)/iu.test(value)) continue;
 		let url: URL;
 		try {
-			url = new URL(decodeEntities(value), base);
+			url = new URL(written(value), base);
 		} catch {
 			continue;
 		}

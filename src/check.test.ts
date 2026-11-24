@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { articleProblem, isPublicUrl, isSupplementUrl, isWholePdf, pdfLinks } from "./check.ts";
+import { articleProblem, blockReason, isPublicUrl, isSupplementUrl, isWholePdf, pdfLinks } from "./check.ts";
 import { PDF } from "./testing.ts";
 
 test.each([
@@ -46,6 +46,35 @@ test("a page's declared PDF comes first, and what is not the paper is left out",
 		"https://journals.example.org/article/1/pdf",
 		"https://cdn.example.org/1.pdf",
 	]);
+});
+
+test("a PDF link is read when it is an icon, escaped whole, behind a download script or in a viewer's frame", () => {
+	const links = (html: string) => pdfLinks(html, new URL("https://journal.example.org/article/7")).map((url) => url.href);
+
+	expect(links('<meta name="citation_pdf_url" content="https%3A%2F%2Fjournal.example.org%2Ffiles%2F7.pdf">')).toEqual(["https://journal.example.org/files/7.pdf"]);
+	expect(links('<a href="/pdf/7.pdf" title="Exporter en PDF"><i class="fa-solid fa-file-pdf"></i></a>')).toEqual(["https://journal.example.org/pdf/7.pdf"]);
+	expect(links('<a href="/cgi-bin/get?data=download(articles,7,f_pdf_ru)"><img src="/img/dnl_pdf.png" alt=""></a>')).toEqual(["https://journal.example.org/cgi-bin/get?data=download(articles,7,f_pdf_ru)"]);
+	expect(links('<a href="/get.php?download=files/7.pdf&amp;aid=1">Download</a>')).toEqual(["https://journal.example.org/get.php?download=files/7.pdf&aid=1"]);
+	expect(links("<iframe class='viewer' src=https://journal.example.org/files/7.pdf frameborder='0'></iframe>")).toEqual(["https://journal.example.org/files/7.pdf"]);
+	// A PDF the page links to without saying what it is, as it does for a paper it cites.
+	expect(links('<a href="/files/cited.pdf"><img src="/img/arrow.png"></a>')).toEqual([]);
+	// A site document named only by its title.
+	expect(links('<a href="/files/123.pdf" title="Author guidelines PDF"><i class="fa-file-pdf"></i></a>')).toEqual([]);
+});
+
+test("Crossref's page for a DOI at several addresses leads to each, and a link run together with another is read", () => {
+	const chooser = '<a href="https://doi.org/10.1/x">DOI</a><a href="https://www.crossref.org/privacy/">Privacy</a><a href="https://mirror.archive.example.org/serve?url=a" alt="">';
+
+	expect(pdfLinks(chooser, new URL("https://chooser.crossref.org/?doi=10.1%2Fx")).map((url) => url.href)).toEqual(["https://mirror.archive.example.org/serve?url=a"]);
+	expect(
+		pdfLinks('<meta name="citation_pdf_url" content="http://archive.example.orghttps://mirror.archive.example.org/serve?url=a.pdf">', new URL("https://mirror.archive.example.org/serve?url=a")).map((url) => url.href),
+	).toEqual(["https://mirror.archive.example.org/serve?url=a.pdf"]);
+});
+
+test("a proof-of-work page in front of a repository or a publisher is a refusal", () => {
+	expect(blockReason(new Headers(), '<title>Bot Detection</title><script src="/static/capjs.js"></script>')).toBe("Cap proof of work");
+	expect(blockReason(new Headers(), '<title>Please wait</title><script src="/products/assets/challenge-6a78.js"></script>')).toBe("Thieme challenge");
+	expect(blockReason(new Headers(), "<title>Please wait</title><p>Your download will start soon.</p>")).toBeUndefined();
 });
 
 test("two universities under one country's registry are two sites", () => {

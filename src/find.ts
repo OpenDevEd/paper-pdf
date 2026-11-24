@@ -253,7 +253,7 @@ class Search {
 		if (this.done || this.skips(candidate.source) || this.seen.has(key)) return;
 		this.seen.add(key);
 		if (isSupplementUrl(candidate.url)) return;
-		const better = rewritten(candidate.url);
+		const better = rewritten(candidate.url, this.paper.doi);
 		// Just ahead of the link it stands in for.
 		if (better) this.add({ ...candidate, url: better, rank: candidate.rank - 0.5 });
 		this.queue.push(candidate);
@@ -360,12 +360,12 @@ class Search {
 			}
 			return record({ outcome: "rejected", note: problem });
 		}
+		// A DOI or a handle may have led to a host that is better asked another way, whatever that host answered.
+		const better = rewritten(fetched.url, this.paper.doi);
+		if (better) this.add({ ...candidate, url: better, rank: RANK.rewrite });
 		if (fetched.outcome === "page") {
 			const listed = listedFiles(fetched.html, fetched.url);
 			const archived = candidate.source === "wayback";
-			// A DOI or a handle may have led to a host that is better asked another way.
-			const better = listed ? undefined : rewritten(fetched.url);
-			if (better) this.add({ ...candidate, url: better, rank: RANK.rewrite });
 			// A saved page's links are read against the site it was saved from, and their saved copies are asked for.
 			// A closed paper's page has no link to the paper, so a link that only reads as a PDF there is something else.
 			const links = listed ?? (candidate.depth < MAX_PAGE_DEPTH ? pdfLinks(fetched.html, (archived && archivedFrom(fetched.url)) || fetched.url, this.paper.openAccess === false) : []);

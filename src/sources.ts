@@ -1,6 +1,7 @@
 /** Where a paper's copies are looked for. Each service is asked once per paper and answers with links to try. */
 
 import { isSupplementUrl, looksLikePdfUrl } from "./check.ts";
+import { MDPI_JOURNALS } from "./mdpi.ts";
 
 export type Source =
 	| "given"
@@ -136,9 +137,11 @@ const FIGSHARE_ITEMS = "https://api.figshare.com/v2/articles/";
 
 /**
  * Another address for the same file where a host is known to serve it better: PubMed Central's open storage for
- * its articles, figshare's record of an item, whose page needs a browser, and the fixed path of an arXiv abstract's PDF.
+ * its articles, figshare's record of an item, whose page needs a browser, the fixed path of an arXiv abstract's PDF,
+ * IEEE Xplore's file address for a paper whose page a script draws, and MDPI's file host for an article whose site
+ * refuses scripts. The paper's DOI names an MDPI journal the table does not hold.
  */
-export function rewritten(url: URL): URL | undefined {
+export function rewritten(url: URL, doi?: string): URL | undefined {
 	// Matched on the host and the path, so another site's link that only mentions one of these is left as it is.
 	const pmc = /^(?:(?:www\.)?ncbi\.nlm\.nih\.gov\/pmc|pmc\.ncbi\.nlm\.nih\.gov|europepmc\.org)\/(?:articles|article\/PMC)\/(?:PMC)?(\d+)(?:\/|$)/iu.exec(url.hostname + url.pathname)?.[1];
 	if (pmc) return pmcListing(pmc);
@@ -147,6 +150,16 @@ export function rewritten(url: URL): URL | undefined {
 	if (figshare) return new URL(FIGSHARE_ITEMS + figshare);
 	const arxiv = /^(?:www\.)?arxiv\.org$/iu.test(url.hostname) ? /^\/abs\/(.+)$/u.exec(url.pathname)?.[1] : undefined;
 	if (arxiv) return new URL(`https://arxiv.org/pdf/${arxiv}`);
+	// Zotero's IEEE Xplore translator reads the same address. It answers a closed paper with the paper's page again.
+	const ieee = /^ieeexplore\.ieee\.org$/iu.test(url.hostname) ? /^\/(?:abstract\/)?document\/(\d+)(?:\/|$)/u.exec(url.pathname)?.[1] : undefined;
+	if (ieee) return new URL(`https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber=${ieee}&ref=`);
+	// An article's address is its journal's ISSN, volume, issue and number. The file is named by journal, volume and number.
+	const mdpi = /^(?:www\.)?mdpi\.com$/iu.test(url.hostname) ? /^\/(\d{4}-\d{3}[\dx])\/(\d+)\/\d+\/(\d+)(?:\/|$)/iu.exec(url.pathname) : null;
+	const journal = mdpi && (MDPI_JOURNALS.get(mdpi[1]!.toUpperCase()) ?? /^10\.3390\/([a-z]+)\d/u.exec(normalizeDoi(doi) ?? "")?.[1]);
+	if (mdpi && journal) {
+		const file = `${journal}-${mdpi[2]!.padStart(2, "0")}-${mdpi[3]!.padStart(5, "0")}`;
+		return new URL(`https://mdpi-res.com/d_attachment/${journal}/${file}/article_deploy/${file}.pdf`);
+	}
 	return undefined;
 }
 

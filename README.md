@@ -21,9 +21,9 @@ A search stops at the first file that is a whole PDF and the paper.
 
 1. **Memory.** A paper that had no copy last time is not searched again until its retry time. That answer costs no request.
 2. **What the caller knows.** A paper OpenAlex calls closed, with no link, costs no request either.
-3. **The caller's own links.** While one of them is delivering a PDF, nothing else is asked. A link to PubMed Central, figshare or an arXiv abstract is swapped for the address that serves the file to a script.
+3. **The caller's own links.** While one of them is delivering a PDF, nothing else is asked. A link to PubMed Central, figshare, an arXiv abstract, IEEE Xplore or MDPI is swapped for the address that serves the file to a script, and so is the page a DOI leads to.
 4. **Services**, once a link fails or takes longer than 1.5 seconds: Crossref's registered full-text links, and Unpaywall unless the caller says its links are all of OpenAlex's (`openAlexLinks`). OpenAlex's record is read where Unpaywall can't be asked. They are asked at the same time.
-5. **Pages.** A landing page's declared PDF (`citation_pdf_url`, a link of type PDF) is followed, then links on the page's own site that read as a PDF and are named one.
+5. **Pages.** A landing page's declared PDF (`citation_pdf_url`, a link of type PDF) is followed, then links on the page's own site that read as a PDF and are named one, by their text, their title or their icon.
 6. **The Internet Archive's saved copy** of a link whose host refused the request or lost the file.
 7. **OpenAlex's own copy**, when `buyOpenAlexCopy` is set and every free copy has failed. OpenAlex charges for each download.
 
@@ -108,7 +108,7 @@ Name the caller plainly, such as `ExampleBot/1.0 (+https://example.org/bot)`, an
 ## What stays out
 
 - Sci-Hub and other copies shared without the publisher's permission.
-- A browser, and requests dressed up as one. A host that challenges scripts is answered from the Internet Archive or left as a miss.
+- A browser, and requests dressed up as one. A host that challenges scripts is answered from another address its publisher serves the file at, from the Internet Archive, or left as a miss.
 - Storage and billing. Both belong to the product.
 
 ## Measured
@@ -141,6 +141,8 @@ Runs that day found between 178 and 185 with a steady connection.
 | This package, both passes | 708 (71%) | |
 
 An earlier run of the same two passes found 709, with the first pass at 106 seconds. The Internet Archive was asked 560 questions, about one a second, and refused none. Before the pacing, one pass of everything at 48 at a time lost 25 of 184 finds on the 250-paper list to refusals.
+
+**The same 1,000 on 24 November 2026**, with MDPI's file host, IEEE Xplore's file address and page links that are an icon, escaped whole or in a viewer's frame: 736 found (74%), 618 in the first pass in 113 seconds and 118 in the second in 478 seconds. The new rules found 24 papers the day before's run had missed: 17 at MDPI's file host, 2 at IEEE Xplore and 5 through page links. All 17 MDPI files carry their paper's title, and asked one by one the file host served a PDF for each of the 38 MDPI papers on the list. Between the two runs 11 more papers were found by routes that had not changed, and 7 found the day before were missed: an archive copy, a busy host or a time-out decides those. Of the 264 misses, 199 met a host that refuses scripts and 126 have a copy OpenAlex sells.
 
 **93 open papers the Evidence Community downloader had failed on** (collected in October 2026): 50 found, 30 of them from the Internet Archive. All 43 misses have a copy OpenAlex sells. Runs ranged from 49 to 54.
 
