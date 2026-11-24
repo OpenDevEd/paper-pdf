@@ -44,6 +44,8 @@ export type DownloadSettings = {
 	deadline?: () => number;
 	/** How long the host may take to answer, when shorter than the usual limit. */
 	answerMs?: number;
+	/** Refuses an address that is not HTTPS, at the first request and at every redirect. */
+	httpsOnly?: boolean;
 	/** Called once the first bytes show a PDF is arriving. */
 	onPdf?: () => void;
 	/**
@@ -102,6 +104,7 @@ export async function download(start: URL, settings: DownloadSettings, referer?:
 		let response: Response;
 		for (let hop = 0; ; hop++) {
 			if (!isPublicUrl(url)) return { outcome: "unsafe", note: "Not a public address", url };
+			if (settings.httpsOnly && url.protocol !== "https:") return { outcome: "unsafe", note: "Not an HTTPS address", url };
 			if (hop > MAX_REDIRECTS) return { outcome: "http", note: "Too many redirects", url };
 			leave?.();
 			leave = undefined;

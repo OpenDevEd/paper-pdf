@@ -50,6 +50,8 @@ export type Options = {
 	memory?: Memory;
 	/** Says why a PDF is not the paper, so the search moves on. `articleProblem` judges extracted text. */
 	accept?: (file: { bytes: Uint8Array; url: string; source: Source }) => Awaitable<string | undefined>;
+	/** Refuses every address that is not HTTPS, for a caller whose rules allow no plain HTTP. Some open PDFs are served over HTTP only. */
+	httpsOnly?: boolean;
 	/** Searches a paper OpenAlex calls closed. Off, such a paper with no link costs no request. */
 	searchClosed?: boolean;
 	/**
@@ -403,7 +405,7 @@ class Search {
 
 	/** One request. A paced service that says it is getting too many is left alone by every search for a while, then asked once more. */
 	private async ask(url: URL, settings: Pick<DownloadSettings, "signal" | "deadline" | "answerMs" | "onPdf">, referer?: URL): Promise<Fetched> {
-		const all = { ...settings, fetch: this.fetch, userAgent: this.userAgent, maxBytes: this.maxBytes, enter: (host: string) => this.enter(host) };
+		const all = { ...settings, fetch: this.fetch, userAgent: this.userAgent, maxBytes: this.maxBytes, enter: (host: string) => this.enter(host), httpsOnly: this.options.httpsOnly ?? false };
 		// Whether a paced service said it is getting too many, which every search then heeds.
 		const held = (fetched: Fetched) => {
 			if (!(fetched.url.hostname in PACED) || fetched.outcome !== "blocked" || fetched.status !== 429) return false;

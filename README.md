@@ -84,6 +84,7 @@ The package keeps no PDFs. The caller stores what it finds and reads its own sto
 | `maxBytes` | 50 MiB | The largest file accepted. |
 | `accept` | none | Returns why a PDF is not the paper, and the search moves on. `articleProblem({ pages, text })` knows preprint cover sheets and publisher previews. |
 | `searchClosed` | off | Searches papers OpenAlex calls closed. |
+| `httpsOnly` | off | Refuses every address that is not HTTPS, by link or by redirect. |
 | `signal` | none | Stops the search. A stopped search is not remembered. |
 
 ## Safety

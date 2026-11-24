@@ -322,6 +322,19 @@ test("a private address is never requested, whether a page links to it or a redi
 	expect(asked.filter((key) => /^(?:169\.254|localhost|10\.)/u.test(key))).toEqual([]);
 });
 
+test("a caller that allows no plain HTTP gets none, by link or by redirect", async () => {
+	const { asked, options } = await serve({
+		"publisher.example/a.pdf": pdf(),
+		"publisher.example/moved.pdf": redirect("http://files.example/b.pdf"),
+		"files.example/b.pdf": pdf(),
+	});
+
+	const result = await findPdf({ urls: ["http://publisher.example/a.pdf", "https://publisher.example/moved.pdf"] }, { ...options, httpsOnly: true, quick: true });
+
+	expect(result.ok).toBe(false);
+	expect(asked).toEqual(["publisher.example/moved.pdf"]);
+});
+
 test("a supplement is not taken for the paper", async () => {
 	const { asked, options } = await serve({
 		"publisher.example/doi/suppl/10.1/x/suppl_file/s1.pdf": pdf(),
